@@ -1,0 +1,11 @@
+[Unit]
+Description=Auto-switch SSC profile based on stream rate
+After=wireplumber.service
+
+[Service]
+ExecStart=%h/.local/bin/ssc-auto
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

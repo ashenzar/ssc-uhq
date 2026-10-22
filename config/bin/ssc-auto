@@ -1,0 +1,135 @@
+#!/bin/bash
+# ssc-auto — auto-switch PipeWire graph rate and SSC profile
+#
+# Monitors active streams and toggles between normal (48k) and hi-res (96k):
+#   Already on UHQ  → only graph rate changes (instant, no audio cut)
+#   On AAC or basic → saves profile, switches to uhq-584 (~15s BT reconnect),
+#                     restores original when hi-res playback ends
+#
+# Usage:  ssc-auto          continuous monitor (systemd or foreground)
+#         ssc-auto --once   single check, then exit
+set -u
+
+POLL=3
+COOLDOWN=30
+CURRENT_RATE=""
+LAST_HIRES=0
+STATE="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/ssc-auto.saved"
+CONF="$HOME/.config/systemd/user/wireplumber.service.d/sscenc.conf"
+
+get_max_stream_rate() {
+    pactl list sink-inputs 2>/dev/null \
+        | grep 'Sample Specification:' \
+        | sed 's/.*[[:space:]]\([0-9]\+\)Hz/\1/' \
+        | sort -rn | head -1
+}
+
+ssc_profile() {
+    grep 'SSCENC_PROFILE=' "$CONF" 2>/dev/null | tail -1 | sed 's/.*=//'
+}
+
+active_card_profile() {
+    pactl list cards 2>/dev/null \
+        | sed -n '/bluez_card/,/^\s*$/p' \
+        | grep -m1 'Active Profile' \
+        | sed 's/.*: //'
+}
+
+profile_to_cmd() {
+    case "${1:-}" in
+        basic-192) echo "phone" ;;
+        basic-229) echo "high" ;;
+        uhq-584)   echo "uhq" ;;
+        uhq-291)   echo "uhq291" ;;
+        uhq-152)   echo "uhq152" ;;
+        *)         echo "" ;;
+    esac
+}
+
+saved_cmd() { cat "$STATE" 2>/dev/null || true; }
+
+set_rate() {
+    local target="$1"
+    case "$target" in
+        hires)  pw-metadata -n settings 0 clock.allowed-rates '[ 48000 96000 ]' >/dev/null 2>&1 || true ;;
+        normal) pw-metadata -n settings 0 clock.allowed-rates '[ 48000 ]' >/dev/null 2>&1 || true ;;
+    esac
+    [[ "$target" != "$CURRENT_RATE" ]] && echo "[$(date +%H:%M:%S)] rate → $target"
+    CURRENT_RATE="$target"
+}
+
+check_and_switch() {
+    local rate saved profile active cmd now
+    rate=$(get_max_stream_rate) || true
+    saved=$(saved_cmd)
+
+    if [[ -n "${rate:-}" ]] && (( rate > 48000 )); then
+        # ── Hi-res stream detected ──
+        LAST_HIRES=$(date +%s)
+
+        if [[ -z "$saved" ]]; then
+            active=$(active_card_profile) || true
+            profile=$(ssc_profile)
+
+            if [[ "${active:-}" == *a2dp-sink && "${active:-}" != *ssc* ]]; then
+                cmd="aac"
+            elif [[ "${profile:-}" != uhq-* ]]; then
+                cmd=$(profile_to_cmd "$profile")
+            else
+                cmd=""
+            fi
+
+            if [[ -n "$cmd" ]]; then
+                echo "$cmd" > "$STATE"
+                echo "[$(date +%H:%M:%S)] profile → uhq-584 (was: $cmd, ~15s reconnect)"
+                ssc-switch uhq >/dev/null 2>&1 || true
+                sleep 18
+            fi
+        fi
+        set_rate hires
+    else
+        # ── Normal / idle ──
+        if [[ -n "$saved" ]]; then
+            now=$(date +%s)
+            if (( now - LAST_HIRES < COOLDOWN )); then
+                return 0
+            fi
+            echo "[$(date +%H:%M:%S)] profile → $saved (restoring, ~15s reconnect)"
+            ssc-switch "$saved" >/dev/null 2>&1 || true
+            rm -f "$STATE"
+            sleep 18
+        fi
+        set_rate normal
+    fi
+}
+
+# ── Startup: clear stale saved state ──
+_saved=$(saved_cmd)
+if [[ -n "$_saved" ]]; then
+    _profile=$(ssc_profile)
+    [[ "${_profile:-}" != uhq-* ]] && rm -f "$STATE"
+fi
+unset _saved _profile
+
+CURRENT_RATE=$(
+    rates=$(pw-metadata -n settings 2>/dev/null | grep 'allowed-rates' | grep -o "'.*'" | tr -d "'" || true)
+    if echo "${rates:-}" | grep -q '96000'; then echo "hires"; else echo "normal"; fi
+)
+
+if [[ "${1:-}" == "--once" ]]; then
+    check_and_switch
+    exit 0
+fi
+
+echo "ssc-auto: monitoring (poll=${POLL}s, cooldown=${COOLDOWN}s)"
+echo "  SSC profile: $(ssc_profile)"
+echo "  rate mode: $CURRENT_RATE"
+_s=$(saved_cmd)
+[[ -n "$_s" ]] && echo "  saved: $_s (will restore when hi-res ends)"
+unset _s
+echo "  Ctrl-C to stop"
+
+while true; do
+    check_and_switch
+    sleep "$POLL"
+done

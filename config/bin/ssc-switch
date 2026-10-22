@@ -1,0 +1,105 @@
+#!/bin/bash
+# Switch the buds between tonight's quality stages for listening comparisons.
+#   abtest.sh aac        AAC, as before tonight (48 kHz / 16-bit, up to 256 kbps)
+#   abtest.sh phone      SSC 192 kbps with the A31 encoder: what the Galaxy A31 itself sends
+#   abtest.sh high       SSC High 229 kbps (48 kHz / 24-bit): more than the A31 sends
+#   abtest.sh uhq        SSC UHQ 584 kbps (96 kHz / 24-bit)
+#   abtest.sh uhq291     SSC UHQ 291 kbps (96 kHz / 24-bit) — Samsung's mid-quality tier
+#   abtest.sh uhq152     SSC UHQ 152 kbps (96 kHz / 24-bit) — Samsung's low-quality tier
+#   abtest.sh uhq442     SSC UHQ 442 kbps (96 kHz / 24-bit) — NOT in Samsung's table, likely silent
+#   abtest.sh uhq250     SSC UHQ 250 kbps (96 kHz / 24-bit) — NOT in Samsung's table, likely silent
+#   abtest.sh status     show what is active now
+#   Optional 2nd argument for SSC modes: encoder input level shift (6 = default 2^29, 5 = -6 dB, 4 = -12 dB)
+#   Optional 3rd argument: RTP timestamps, "samples" (PipeWire default) or "frames" (+1 per packet, like the A31 phone)
+# SSC modes restart WirePlumber and reconnect the buds (~15 s); aac only switches the profile.
+# The buds volume is kept, so match loudness by ear before judging.
+set -e
+CONF=~/.config/systemd/user/wireplumber.service.d/sscenc.conf
+CARD=bluez_card.E8_C9_13_75_5F_AD
+S24=$HOME/src/ssc-blob/s24u/libScalable_Encoder.so
+A31=$HOME/src/ssc-blob/libScalable_Encoder.so
+
+status() {
+    local sink profile mode rates active
+    sink=$(pactl list short sinks | awk '/bluez_output/{print $2; exit}')
+
+    # profile name
+    active=$(pactl list cards 2>/dev/null | sed -n "/$CARD/,\$p" | grep -m1 'Active Profile' | sed 's/.*: //')
+    if [[ "$active" == *a2dp-sink && "$active" != *ssc* ]]; then
+        profile="aac"
+    else
+        case "$(grep 'SSCENC_PROFILE=' "$CONF" 2>/dev/null | tail -1 | sed 's/.*=//')" in
+            basic-192) profile="phone" ;;
+            basic-229) profile="high" ;;
+            uhq-584)   profile="uhq" ;;
+            uhq-291)   profile="uhq291" ;;
+            uhq-152)   profile="uhq152" ;;
+            *)         profile="unknown" ;;
+        esac
+    fi
+
+    # graph mode
+    rates=$(pw-metadata -n settings 2>/dev/null | grep 'allowed-rates' | grep -o "'.*'" | tr -d "'")
+    if echo "$rates" | grep -q '96000'; then
+        if echo "$rates" | grep -q '48000'; then
+            mode="hires"
+        else
+            mode="direct"
+        fi
+    else
+        mode="normal"
+    fi
+
+    echo "  [$profile $mode]"
+    pactl list cards 2>/dev/null | sed -n "/$CARD/,\$p" | grep -m1 'Active Profile' | sed 's/^/  /'
+    pactl list sinks 2>/dev/null | sed -n "/Name: $sink/,/Formats/p" | grep -E 'Sample Specification|api.bluez5.codec|Volume: front' | sed 's/^\s*/  /'
+    ps -eo args 2>/dev/null | grep '[s]sc_blob_helper' | grep -v systemd-run | sed 's/.*ssc-blob\//  encoder: /'
+    grep -h '^Environment=SSCENC_INPUT_SHIFT=' "$CONF" | sed 's/.*=/  input shift: /'
+    grep -h '^Environment=SSCENC_RTP_TS=' "$CONF" | sed 's/.*=/  rtp timestamps: /'
+}
+
+SHIFT=${2:-6}
+RTP_OVERRIDE=${3:-}
+# Samsung sends per-packet +1 timestamps ("frames") for all modes.
+rtp_for() {
+    if [ -n "$RTP_OVERRIDE" ]; then echo "$RTP_OVERRIDE"; return; fi
+    echo frames
+}
+ssc() {  # ssc PROFILE ENCODER
+    local rtp
+    rtp=$(rtp_for "$1")
+    sed -i '/^Environment=SSCENC_BLOB_SO=/d;/^Environment=SSCENC_PROFILE=/d;/^Environment=SSCENC_INPUT_SHIFT=/d' "$CONF"
+    sed -i '/^Environment=SSCENC_RTP_TS=/d;/^Environment=SSCENC_BASIC_RATE=/d' "$CONF"
+    printf 'Environment=SSCENC_BLOB_SO=%s\nEnvironment=SSCENC_PROFILE=%s\nEnvironment=SSCENC_RTP_TS=%s\n' "$2" "$1" "$rtp" >> "$CONF"
+    ~/src/ssc-capture/set_ssc.sh "$1" "$SHIFT" >/dev/null
+}
+
+case "${1:-status}" in
+    aac)    pactl set-card-profile "$CARD" a2dp-sink ;;
+    phone)  ssc basic-192 "$A31" ;;
+    high)   ssc basic-229 "$S24" ;;
+    uhq)    ssc uhq-584 "$S24" ;;
+    uhq291) ssc uhq-291 "$S24" ;;
+    uhq152) ssc uhq-152 "$S24" ;;
+    hires)
+        pw-metadata -n settings 0 clock.allowed-rates '[ 48000 96000 ]' >/dev/null 2>&1
+        echo "  graph: 96k unlocked (native playback for hi-res)"
+        echo "  run 'ssc-switch normal' when done to restore double-resample path"
+        ;;
+    direct)
+        pw-metadata -n settings 0 clock.allowed-rates '[ 96000 ]' >/dev/null 2>&1
+        pw-metadata -n settings 0 clock.force-rate '96000' >/dev/null 2>&1
+        echo "  graph: locked at 96k (single-step SPA resample, quality=14)"
+        echo "  44.1→96k (2.177:1) and 48→96k (2:1) via SPA directly"
+        echo "  run 'ssc-switch normal' to restore double-resample path"
+        ;;
+    normal)
+        pw-metadata -n settings 0 clock.allowed-rates '[ 48000 ]' >/dev/null 2>&1
+        pw-metadata -n settings 0 clock.force-rate '0' >/dev/null 2>&1
+        echo "  graph: locked at 48k (double-resample path for 44.1k content)"
+        ;;
+    status) ;;
+    *) echo "Usage: ssc-switch {status|aac|high|uhq|direct|hires|normal}"; exit 1 ;;
+esac
+sleep 1
+status
