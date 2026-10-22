@@ -1,0 +1,1348 @@
+diff --git a/spa/include/spa/param/bluetooth/audio.h b/spa/include/spa/param/bluetooth/audio.h
+index 34b45e2..973f407 100644
+--- a/spa/include/spa/param/bluetooth/audio.h
++++ b/spa/include/spa/param/bluetooth/audio.h
+@@ -36,6 +36,7 @@ enum spa_bluetooth_audio_codec {
+ 	SPA_BLUETOOTH_AUDIO_CODEC_OPUS_05_DUPLEX,
+ 	SPA_BLUETOOTH_AUDIO_CODEC_OPUS_05_PRO,
+ 	SPA_BLUETOOTH_AUDIO_CODEC_OPUS_G,
++	SPA_BLUETOOTH_AUDIO_CODEC_SSC,
+ 
+ 	/* HFP */
+ 	SPA_BLUETOOTH_AUDIO_CODEC_CVSD = 0x100,
+diff --git a/spa/include/spa/param/bluetooth/type-info.h b/spa/include/spa/param/bluetooth/type-info.h
+index 7bf1da5..08c61af 100644
+--- a/spa/include/spa/param/bluetooth/type-info.h
++++ b/spa/include/spa/param/bluetooth/type-info.h
+@@ -40,6 +40,7 @@ static const struct spa_type_info spa_type_bluetooth_audio_codec[] = {
+ 	{ SPA_BLUETOOTH_AUDIO_CODEC_OPUS_05_DUPLEX, SPA_TYPE_Int, SPA_TYPE_INFO_BLUETOOTH_AUDIO_CODEC_BASE "opus_05_duplex", NULL },
+ 	{ SPA_BLUETOOTH_AUDIO_CODEC_OPUS_05_PRO, SPA_TYPE_Int, SPA_TYPE_INFO_BLUETOOTH_AUDIO_CODEC_BASE "opus_05_pro", NULL },
+ 	{ SPA_BLUETOOTH_AUDIO_CODEC_OPUS_G, SPA_TYPE_Int, SPA_TYPE_INFO_BLUETOOTH_AUDIO_CODEC_BASE "opus_g", NULL },
++	{ SPA_BLUETOOTH_AUDIO_CODEC_SSC, SPA_TYPE_Int, SPA_TYPE_INFO_BLUETOOTH_AUDIO_CODEC_BASE "ssc", NULL },
+ 
+ 	{ SPA_BLUETOOTH_AUDIO_CODEC_CVSD, SPA_TYPE_Int, SPA_TYPE_INFO_BLUETOOTH_AUDIO_CODEC_BASE "cvsd", NULL },
+ 	{ SPA_BLUETOOTH_AUDIO_CODEC_MSBC, SPA_TYPE_Int, SPA_TYPE_INFO_BLUETOOTH_AUDIO_CODEC_BASE "msbc", NULL },
+diff --git a/spa/plugins/bluez5/a2dp-codec-ssc.c b/spa/plugins/bluez5/a2dp-codec-ssc.c
+new file mode 100644
+index 0000000..d264982
+--- /dev/null
++++ b/spa/plugins/bluez5/a2dp-codec-ssc.c
+@@ -0,0 +1,427 @@
++/* Experimental Samsung SSC A2DP codec for PipeWire BlueZ5. */
++
++#include <arpa/inet.h>
++#include <errno.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdbool.h>
++#include <string.h>
++#include <stdlib.h>
++#include <stdio.h>
++
++#include <spa/param/audio/format.h>
++#include <spa/utils/string.h>
++
++#include "rtp.h"
++#include "media-codecs.h"
++#include "ssc/encoder.h"
++
++#define SSC_VENDOR_ID 0x00000075u
++#define SSC_CODEC_ID  0x0103u
++
++/*
++ * S948BXXS3AZF4 libbluetooth_jni.so parses the post-vendor SSC byte as:
++ *   0xf0: sample-rate/mode high nibble
++ *   0x08: bitrate-limitation flag
++ *   0x04: 24-bit / HiFi-ish flag
++ *   0x02: UHQ2 / 96 kHz-ish flag
++ *
++ * The default profile keeps 0x02 off because the recovered working capture used
++ * 0x0c. Test profiles deliberately advertise 0x02 and/or unsupported bitrates
++ * so Buds behavior can be probed without rebuilding.
++ */
++#define SSC_CAP_RATE_MASK      0xf0u
++#define SSC_CAP_RATE_48000     0x10u
++#define SSC_CAP_BITRATE_LIMIT  0x08u
++#define SSC_CAP_HIFI_24        0x04u
++#define SSC_CAP_UHQ2           0x02u
++#define SSC_CAP_BASIC_48K      (SSC_CAP_BITRATE_LIMIT | SSC_CAP_HIFI_24)
++#define SSC_CAP_UHQ_TEST       (SSC_CAP_BASIC_48K | SSC_CAP_UHQ2)
++#define SSC_CAP_HIFI_OPEN      SSC_CAP_HIFI_24
++#define SSC_CAP_UHQ_OPEN       (SSC_CAP_HIFI_24 | SSC_CAP_UHQ2)
++#define SSC_PROFILE_ENV        "SSCENC_PROFILE"
++
++struct ssc_profile {
++	const char *name;
++	uint32_t bitrate;
++	uint32_t frame_samples;
++	uint8_t capabilities;
++};
++
++static const struct ssc_profile ssc_profiles[] = {
++	{ "default",       192000,  SSCENC_FRAME_SAMPLES, SSC_CAP_BASIC_48K },
++	{ "samsung",       192000,  SSCENC_FRAME_SAMPLES, SSC_CAP_BASIC_48K },
++	{ "samsung-basic", 192000,  SSCENC_FRAME_SAMPLES, SSC_CAP_BASIC_48K },
++	{ "samsung-default", 192000, SSCENC_FRAME_SAMPLES, SSC_CAP_BASIC_48K },
++	{ "basic-88",       88000,  SSCENC_FRAME_SAMPLES, SSC_CAP_BASIC_48K },
++	{ "basic-96",       96000,  SSCENC_FRAME_SAMPLES, SSC_CAP_BASIC_48K },
++	{ "basic-128",     128000,  SSCENC_FRAME_SAMPLES, SSC_CAP_BASIC_48K },
++	{ "basic-192",     192000,  SSCENC_FRAME_SAMPLES, SSC_CAP_BASIC_48K },
++	{ "basic-229",     229000,  SSCENC_FRAME_SAMPLES, SSC_CAP_BASIC_48K },
++	{ "basic-256",     256000,  SSCENC_FRAME_SAMPLES, SSC_CAP_BASIC_48K },
++	{ "basic-328",     328000,  SSCENC_FRAME_SAMPLES, SSC_CAP_BASIC_48K },
++	{ "force-high",    328000,  SSCENC_FRAME_SAMPLES, SSC_CAP_BASIC_48K },
++	{ "basic-max",     328000,  SSCENC_FRAME_SAMPLES, SSC_CAP_BASIC_48K },
++	{ "top-basic",     328000,  SSCENC_FRAME_SAMPLES, SSC_CAP_BASIC_48K },
++	{ "open-basic-229", 229000, SSCENC_FRAME_SAMPLES, SSC_CAP_HIFI_OPEN },
++	{ "open-basic-256", 256000, SSCENC_FRAME_SAMPLES, SSC_CAP_HIFI_OPEN },
++	{ "open-basic-328", 328000, SSCENC_FRAME_SAMPLES, SSC_CAP_HIFI_OPEN },
++	{ "uhq-152",       152000,  SSCENC_FRAME_SAMPLES, SSC_CAP_UHQ_TEST },
++	{ "uhq-250",       250000,  SSCENC_FRAME_SAMPLES, SSC_CAP_UHQ_TEST },
++	{ "uhq-291",       291000,  SSCENC_FRAME_SAMPLES, SSC_CAP_UHQ_TEST },
++	{ "uhq-308",       308000,  SSCENC_FRAME_SAMPLES, SSC_CAP_UHQ_TEST },
++	{ "uhq-442",       442000,  SSCENC_FRAME_SAMPLES, SSC_CAP_UHQ_TEST },
++	{ "uhq-584",       584000,  SSCENC_FRAME_SAMPLES, SSC_CAP_UHQ_TEST },
++	{ "uhq-886",       886000,  SSCENC_FRAME_SAMPLES, SSC_CAP_UHQ_TEST },
++	{ "uhq-max",       886000,  SSCENC_FRAME_SAMPLES, SSC_CAP_UHQ_TEST },
++	{ "open-uhq-250",  250000,  SSCENC_FRAME_SAMPLES, SSC_CAP_UHQ_OPEN },
++	{ "open-uhq-291",  291000,  SSCENC_FRAME_SAMPLES, SSC_CAP_UHQ_OPEN },
++	{ "open-uhq-308",  308000,  SSCENC_FRAME_SAMPLES, SSC_CAP_UHQ_OPEN },
++	{ "open-uhq-442",  442000,  SSCENC_FRAME_SAMPLES, SSC_CAP_UHQ_OPEN },
++	{ "short-basic-192", 192000, 512, SSC_CAP_BASIC_48K },
++	{ "short-basic-229", 229000, 512, SSC_CAP_BASIC_48K },
++	{ "short-uhq-291", 291000, 512, SSC_CAP_UHQ_TEST },
++	{ "short-uhq-308", 308000, 512, SSC_CAP_UHQ_TEST },
++	{ "short-uhq-442", 442000, 512, SSC_CAP_UHQ_TEST },
++	{ "short-uhq-584", 584000, 512, SSC_CAP_UHQ_TEST },
++	{ "short-open-uhq-291", 291000, 512, SSC_CAP_UHQ_OPEN },
++	{ "short-open-uhq-308", 308000, 512, SSC_CAP_UHQ_OPEN },
++	{ "short-open-uhq-442", 442000, 512, SSC_CAP_UHQ_OPEN },
++	{ "short-open-uhq-584", 584000, 512, SSC_CAP_UHQ_OPEN },
++	{ "stress-512",    512000,  SSCENC_FRAME_SAMPLES, SSC_CAP_UHQ_TEST },
++	{ "stress-768",    768000,  SSCENC_FRAME_SAMPLES, SSC_CAP_UHQ_TEST },
++	{ "stress-990",    990000,  SSCENC_FRAME_SAMPLES, SSC_CAP_UHQ_TEST },
++	{ "stress-1200",  1200000,  SSCENC_FRAME_SAMPLES, SSC_CAP_UHQ_TEST },
++	{ "stress-1411",  1411000,  SSCENC_FRAME_SAMPLES, SSC_CAP_UHQ_TEST },
++	{ "stress-2304",  2304000,  SSCENC_FRAME_SAMPLES, SSC_CAP_UHQ_TEST },
++	{ "probably-broken-2304", 2304000, SSCENC_FRAME_SAMPLES, SSC_CAP_UHQ_TEST },
++	{ "stress-3200",  3200000,  SSCENC_FRAME_SAMPLES, SSC_CAP_UHQ_TEST },
++};
++
++static const struct ssc_profile *ssc_profile_current(void)
++{
++	const char *name = getenv(SSC_PROFILE_ENV);
++	size_t i;
++
++	if (name == NULL || name[0] == '\0')
++		name = "default";
++	for (i = 0; i < sizeof(ssc_profiles) / sizeof(ssc_profiles[0]); ++i) {
++		if (spa_streq(name, ssc_profiles[i].name))
++			return &ssc_profiles[i];
++	}
++	return &ssc_profiles[0];
++}
++
++static int ssc_caps_valid_for_profile(uint8_t capabilities, const struct ssc_profile *profile)
++{
++	if ((capabilities & SSC_CAP_HIFI_24) == 0 ||
++	    (capabilities & ~(SSC_CAP_RATE_MASK | SSC_CAP_BITRATE_LIMIT | SSC_CAP_HIFI_24 | SSC_CAP_UHQ2)) != 0)
++		return 0;
++	if ((capabilities & SSC_CAP_UHQ2) != 0 &&
++	    (profile->capabilities & SSC_CAP_UHQ2) == 0)
++		return 0;
++	return 1;
++}
++#ifdef SSCENC_BLOB_HELPER
++/* Feed the Samsung blob 24-bit samples right-justified in 32-bit containers,
++ * matching the negotiated bits_per_sample=24. (If output is silent/quiet,
++ * the next thing to try is left-justified S32 — i.e. the blob wanting the
++ * 24-bit value in the high bits.) */
++#define SSCENC_SPA_FORMAT SPA_AUDIO_FORMAT_S24_32
++#define SSCENC_SAMPLE_SIZE sizeof(int32_t)
++#else
++#define SSCENC_SPA_FORMAT SPA_AUDIO_FORMAT_S16
++#define SSCENC_SAMPLE_SIZE sizeof(int16_t)
++#endif
++
++
++struct __attribute__((packed)) a2dp_ssc {
++	a2dp_vendor_codec_t info;
++	uint8_t capabilities;
++};
++
++struct impl {
++	sscenc_encoder *enc;
++	sscenc_config cfg;
++	struct rtp_header *header;
++	size_t frame_samples;
++	size_t block_size;
++	/* SSCENC_RTP_TS=frames: RTP timestamp counts packets (+1 each), as the Galaxy A31 does on air;
++	 * default "samples" keeps PipeWire's sample-count timestamp. */
++	bool ts_frames;
++	uint32_t frame_counter;
++};
++
++
++static int codec_fill_caps(const struct media_codec *codec, uint32_t flags,
++		const struct spa_dict *settings, uint8_t caps[A2DP_MAX_CAPS_SIZE])
++{
++	(void)codec;
++	(void)flags;
++	(void)settings;
++	const struct ssc_profile *profile = ssc_profile_current();
++	const struct a2dp_ssc a2dp_ssc = {
++		.info.vendor_id = SSC_VENDOR_ID,
++		.info.codec_id = SSC_CODEC_ID,
++		.capabilities = profile->capabilities,
++	};
++
++	memcpy(caps, &a2dp_ssc, sizeof(a2dp_ssc));
++	return sizeof(a2dp_ssc);
++}
++
++static int codec_select_config(const struct media_codec *codec, uint32_t flags,
++		const void *caps, size_t caps_size,
++		const struct media_codec_audio_info *info,
++		const struct spa_dict *settings, uint8_t config[A2DP_MAX_CAPS_SIZE]
++#if SPA_VERSION_BLUEZ5_CODEC_MEDIA >= 16
++		, void **config_data
++#endif
++		)
++{
++	(void)flags;
++	(void)info;
++	(void)settings;
++#if SPA_VERSION_BLUEZ5_CODEC_MEDIA >= 16
++	(void)config_data;
++#endif
++	struct a2dp_ssc conf;
++	const struct ssc_profile *profile = ssc_profile_current();
++
++	if (caps_size < sizeof(conf))
++		return -EINVAL;
++
++	memcpy(&conf, caps, sizeof(conf));
++	if (conf.info.vendor_id != codec->vendor.vendor_id ||
++	    conf.info.codec_id != codec->vendor.codec_id)
++		return -ENOTSUP;
++	if ((conf.capabilities & SSC_CAP_HIFI_24) == 0)
++		return -ENOTSUP;
++
++	conf.capabilities = profile->capabilities;
++
++	memcpy(config, &conf, sizeof(conf));
++	return sizeof(conf);
++}
++
++static int codec_validate_config(const struct media_codec *codec, uint32_t flags,
++		const void *caps, size_t caps_size, struct spa_audio_info *info)
++{
++	(void)flags;
++	const struct a2dp_ssc *conf = caps;
++	const struct ssc_profile *profile = ssc_profile_current();
++	int rate;
++	int channels = 2;
++
++	if (caps == NULL || caps_size < sizeof(*conf))
++		return -EINVAL;
++	if (conf->info.vendor_id != codec->vendor.vendor_id ||
++	    conf->info.codec_id != codec->vendor.codec_id)
++		return -EINVAL;
++	if (!ssc_caps_valid_for_profile(conf->capabilities, profile))
++		return -EINVAL;
++#ifdef SSCENC_BLOB_HELPER
++	if (conf->capabilities & SSC_CAP_UHQ2) {
++		rate = 96000;
++	} else {
++		/* Samsung passes 44100 for basic mode (F9). Env override for testing. */
++		const char *renv = getenv("SSCENC_BASIC_RATE");
++		rate = (renv && atoi(renv) == 44100) ? 44100 : 48000;
++	}
++#else
++	rate = 48000;
++#endif
++
++	spa_zero(*info);
++	info->media_type = SPA_MEDIA_TYPE_audio;
++	info->media_subtype = SPA_MEDIA_SUBTYPE_raw;
++	info->info.raw.format = SSCENC_SPA_FORMAT;
++	info->info.raw.rate = (uint32_t)rate;
++	info->info.raw.channels = (uint32_t)channels;
++	if (channels == 1) {
++		info->info.raw.position[0] = SPA_AUDIO_CHANNEL_MONO;
++	} else {
++		info->info.raw.position[0] = SPA_AUDIO_CHANNEL_FL;
++		info->info.raw.position[1] = SPA_AUDIO_CHANNEL_FR;
++	}
++	return 0;
++}
++
++static int codec_enum_config(const struct media_codec *codec, uint32_t flags,
++		const void *caps, size_t caps_size, uint32_t id, uint32_t idx,
++		struct spa_pod_builder *b, struct spa_pod **param)
++{
++	struct spa_audio_info info;
++	struct spa_pod_frame f[1];
++	int res;
++
++	if ((res = codec_validate_config(codec, flags, caps, caps_size, &info)) < 0)
++		return res;
++	if (idx > 0)
++		return 0;
++
++	spa_pod_builder_push_object(b, &f[0], SPA_TYPE_OBJECT_Format, id);
++	spa_pod_builder_add(b,
++			SPA_FORMAT_mediaType,      SPA_POD_Id(info.media_type),
++			SPA_FORMAT_mediaSubtype,   SPA_POD_Id(info.media_subtype),
++			SPA_FORMAT_AUDIO_format,   SPA_POD_Id(info.info.raw.format),
++			SPA_FORMAT_AUDIO_rate,     SPA_POD_Int(info.info.raw.rate),
++			SPA_FORMAT_AUDIO_channels, SPA_POD_Int(info.info.raw.channels),
++			SPA_FORMAT_AUDIO_position, SPA_POD_Array(sizeof(uint32_t),
++					SPA_TYPE_Id, info.info.raw.channels, info.info.raw.position),
++			0);
++
++	*param = spa_pod_builder_pop(b, &f[0]);
++	return *param == NULL ? -EIO : 1;
++}
++
++static void *codec_init(const struct media_codec *codec, uint32_t flags,
++		void *config, size_t config_size, const struct spa_audio_info *info,
++		void *props, size_t mtu)
++{
++	(void)flags;
++	(void)props;
++	(void)mtu;
++	struct impl *this;
++	struct a2dp_ssc *conf = config;
++	uint32_t rate, channels;
++	const struct ssc_profile *profile = ssc_profile_current();
++
++	if (config_size < sizeof(*conf) || !info ||
++	    conf->info.vendor_id != codec->vendor.vendor_id ||
++	    conf->info.codec_id != codec->vendor.codec_id ||
++	    !ssc_caps_valid_for_profile(conf->capabilities, profile) ||
++	    info->media_type != SPA_MEDIA_TYPE_audio ||
++	    info->media_subtype != SPA_MEDIA_SUBTYPE_raw ||
++	    info->info.raw.format != SSCENC_SPA_FORMAT)
++		return NULL;
++
++	rate = info->info.raw.rate;
++	channels = info->info.raw.channels;
++	if ((rate != 44100 && rate != 48000 && rate != 96000) || channels == 0 || channels > 2)
++		return NULL;
++
++	this = calloc(1, sizeof(*this));
++	if (this == NULL)
++		return NULL;
++	if (sscenc_config_basic(&this->cfg, rate, (uint8_t)channels, profile->bitrate) != SSCENC_OK)
++		goto fail;
++	this->enc = sscenc_create(&this->cfg);
++	if (this->enc == NULL)
++		goto fail;
++	this->frame_samples = profile->frame_samples;
++	this->ts_frames = !spa_streq(getenv("SSCENC_RTP_TS"), "samples");
++	fprintf(stderr, "openssc: profile %s bitrate %u frame_samples %u write_mtu %zu rtp_ts %s\n",
++		profile->name, profile->bitrate, profile->frame_samples, mtu, this->ts_frames ? "frames" : "samples");
++	this->block_size = this->frame_samples * (size_t)channels * SSCENC_SAMPLE_SIZE;
++	return this;
++
++fail:
++	free(this);
++	return NULL;
++}
++
++static void codec_deinit(void *data)
++{
++	struct impl *this = data;
++	sscenc_destroy(this->enc);
++	free(this);
++}
++
++static int codec_get_block_size(void *data)
++{
++	struct impl *this = data;
++	return (int)this->block_size;
++}
++
++static uint64_t codec_get_interval(void *data)
++{
++	struct impl *this = data;
++	return (uint64_t)this->frame_samples * SPA_NSEC_PER_SEC / this->cfg.sample_rate;
++}
++
++static int codec_abr_process(void *data, size_t unsent)
++{
++	(void)data;
++	(void)unsent;
++	return -ENOTSUP;
++}
++
++static int codec_start_encode(void *data, void *dst, size_t dst_size,
++		uint16_t seqnum, uint32_t timestamp)
++{
++	struct impl *this = data;
++	const size_t header_size = sizeof(struct rtp_header);
++
++	if (dst_size < header_size)
++		return -ENOSPC;
++
++	this->header = (struct rtp_header *)dst;
++	memset(this->header, 0, header_size);
++	this->header->v = 2;
++	this->header->pt = 96;
++	this->header->sequence_number = htons(seqnum);
++	this->header->timestamp = htonl(this->ts_frames ? ++this->frame_counter : timestamp);
++	this->header->ssrc = htonl(0xffu);
++	return (int)header_size;
++}
++
++static int codec_encode(void *data,
++		const void *src, size_t src_size,
++		void *dst, size_t dst_size,
++		size_t *dst_out, int *need_flush)
++{
++	struct impl *this = data;
++	int res;
++
++	*dst_out = 0;
++	if (src == NULL)
++		return -EINVAL;
++	if (src_size < this->block_size)
++		return 0;
++
++#ifdef SSCENC_BLOB_HELPER
++	res = sscenc_encode_s32(this->enc, src, this->frame_samples, dst, dst_size, dst_out);
++#else
++	res = sscenc_encode_s16(this->enc, src, this->frame_samples, dst, dst_size, dst_out);
++#endif
++	if (res != SSCENC_OK)
++		return -EINVAL;
++
++	*need_flush = NEED_FLUSH_ALL;
++	return (int)this->block_size;
++}
++
++static void codec_get_delay(void *data, uint32_t *encoder, uint32_t *decoder)
++{
++	(void)data;
++	if (encoder)
++		*encoder = 0;
++	if (decoder)
++		*decoder = 0;
++}
++
++const struct media_codec a2dp_codec_ssc = {
++	.id = SPA_BLUETOOTH_AUDIO_CODEC_SSC,
++#if SPA_VERSION_BLUEZ5_CODEC_MEDIA >= 16
++	.kind = MEDIA_CODEC_A2DP,
++#endif
++	.codec_id = A2DP_CODEC_VENDOR,
++	.vendor = { .vendor_id = SSC_VENDOR_ID, .codec_id = SSC_CODEC_ID },
++	.name = "ssc",
++	.description = "Samsung SSC (experimental)",
++	.fill_caps = codec_fill_caps,
++	.select_config = codec_select_config,
++	.enum_config = codec_enum_config,
++	.validate_config = codec_validate_config,
++	.init = codec_init,
++	.deinit = codec_deinit,
++	.get_block_size = codec_get_block_size,
++	.get_interval = codec_get_interval,
++	.abr_process = codec_abr_process,
++	.start_encode = codec_start_encode,
++	.encode = codec_encode,
++	.get_delay = codec_get_delay,
++};
++
++MEDIA_CODEC_EXPORT_DEF("ssc", &a2dp_codec_ssc);
+diff --git a/spa/plugins/bluez5/backend-native.c b/spa/plugins/bluez5/backend-native.c
+index 7c5fcef..6241942 100644
+--- a/spa/plugins/bluez5/backend-native.c
++++ b/spa/plugins/bluez5/backend-native.c
+@@ -1239,10 +1239,22 @@ static bool rfcomm_hfp_ag(struct rfcomm *rfcomm, char* buf)
+ 			return true;
+ 		}
+ 
+-		rfcomm->codec = selected_codec;
+-
+ 		spa_log_debug(backend->log, "RFCOMM selected_codec = %i", selected_codec);
+ 
++		if (rfcomm->transport != NULL && rfcomm->codec == selected_codec) {
++			/* The headset re-confirmed the codec that is already in use (some headsets send
++			 * AT+BCC on every audio connection).  Keep the transport: freeing it here would
++			 * close a SCO socket whose connection may still be in progress, which leaves an
++			 * orphaned eSCO link in the controller and breaks all later SCO setups.
++			 * For the same reason no codec_switched event is emitted: the device would
++			 * remove and re-create its nodes, releasing the transport mid-connect. */
++			spa_log_debug(backend->log, "RFCOMM codec unchanged, keeping transport");
++			rfcomm_send_reply(rfcomm, "OK");
++			return true;
++		}
++
++		rfcomm->codec = selected_codec;
++
+ 		/* Recreate transport, since previous connection may now be invalid */
+ 		if (rfcomm_new_transport(rfcomm, selected_codec) < 0) {
+ 			// TODO: We should manage the missing transport
+diff --git a/spa/plugins/bluez5/bluez5-dbus.c b/spa/plugins/bluez5/bluez5-dbus.c
+index 34b39a9..dd396b1 100644
+--- a/spa/plugins/bluez5/bluez5-dbus.c
++++ b/spa/plugins/bluez5/bluez5-dbus.c
+@@ -3452,6 +3452,8 @@ int spa_bt_transport_acquire(struct spa_bt_transport *transport, bool optional)
+ 	if (res >= 0) {
+ 		transport->acquire_refcount = 1;
+ 		transport->acquired = true;
++		/* a transport that acquires is working */
++		transport->error_count = 0;
+ 	}
+ 
+ 	return res;
+@@ -3703,6 +3705,7 @@ int64_t spa_bt_transport_get_delay_nsec(struct spa_bt_transport *t)
+ 	case SPA_BLUETOOTH_AUDIO_CODEC_APTX:
+ 	case SPA_BLUETOOTH_AUDIO_CODEC_APTX_HD:
+ 	case SPA_BLUETOOTH_AUDIO_CODEC_LDAC:
++	case SPA_BLUETOOTH_AUDIO_CODEC_SSC:
+ 		return 125 * SPA_NSEC_PER_MSEC;
+ 	case SPA_BLUETOOTH_AUDIO_CODEC_AAC_ELD:
+ 	case SPA_BLUETOOTH_AUDIO_CODEC_APTX_LL:
+diff --git a/spa/plugins/bluez5/bluez5-device.c b/spa/plugins/bluez5/bluez5-device.c
+index fc659f6..57676d0 100644
+--- a/spa/plugins/bluez5/bluez5-device.c
++++ b/spa/plugins/bluez5/bluez5-device.c
+@@ -791,6 +791,7 @@ static void dynamic_node_transport_state_changed(void *data,
+ 		if (SPA_FLAG_IS_SET(this->id, DYNAMIC_NODE_ID_FLAG)) {
+ 			SPA_FLAG_CLEAR(this->id, DYNAMIC_NODE_ID_FLAG);
+ 			spa_bt_transport_keepalive(t, false);
++			spa_bt_transport_emit_remove_node(t);
+ 			spa_device_emit_object_info(&impl->hooks, this->id, NULL);
+ 		}
+ 	}
+@@ -1209,6 +1210,9 @@ static int emit_nodes(struct impl *this)
+ {
+ 	struct spa_bt_transport *t;
+ 
++	if (!this->bt_dev)
++		return 0;
++
+ 	switch (this->profile) {
+ 	case DEVICE_PROFILE_BAP:
+ 	case DEVICE_PROFILE_BAP_SINK:
+@@ -1413,6 +1417,8 @@ static void emit_remove_nodes(struct impl *this)
+ 		struct node * node = &this->nodes[i];
+ 		node_offload_set_active(node, false);
+ 		if (node->transport) {
++			if (node->active)
++				spa_bt_transport_emit_remove_node(node->transport);
+ 			spa_hook_remove(&node->transport_listener);
+ 			node->transport = NULL;
+ 		}
+@@ -1746,6 +1752,15 @@ static void device_switch_profile(void *userdata)
+ 	set_profile(this, profile, 0, false);
+ }
+ 
++static void device_destroy(void *userdata)
++{
++	struct impl *this = userdata;
++
++	/* The device is being freed; it must not be dereferenced anymore. */
++	spa_hook_remove(&this->bt_dev_listener);
++	this->bt_dev = NULL;
++}
++
+ static const struct spa_bt_device_events bt_dev_events = {
+ 	SPA_VERSION_BT_DEVICE_EVENTS,
+ 	.connected = device_connected,
+@@ -1754,6 +1769,7 @@ static const struct spa_bt_device_events bt_dev_events = {
+ 	.profiles_changed = profiles_changed,
+ 	.device_set_changed = device_set_changed,
+ 	.switch_profile = device_switch_profile,
++	.destroy = device_destroy,
+ };
+ 
+ static int impl_add_listener(void *object,
+@@ -2761,6 +2777,9 @@ static int impl_enum_params(void *object, int seq,
+ 	spa_return_val_if_fail(this != NULL, -EINVAL);
+ 	spa_return_val_if_fail(num != 0, -EINVAL);
+ 
++	if (!this->bt_dev)
++		return -ENODEV;
++
+ 	result.id = id;
+ 	result.next = start;
+       next:
+@@ -3146,6 +3165,9 @@ static int impl_set_param(void *object,
+ 
+ 	spa_return_val_if_fail(this != NULL, -EINVAL);
+ 
++	if (!this->bt_dev)
++		return -ENODEV;
++
+ 	switch (id) {
+ 	case SPA_PARAM_Profile:
+ 	{
+diff --git a/spa/plugins/bluez5/codec-loader.c b/spa/plugins/bluez5/codec-loader.c
+index 68e6af7..b750dc6 100644
+--- a/spa/plugins/bluez5/codec-loader.c
++++ b/spa/plugins/bluez5/codec-loader.c
+@@ -56,6 +56,7 @@ static int codec_order(const struct media_codec *c)
+ 		SPA_BLUETOOTH_AUDIO_CODEC_LC3_A127,
+ 		SPA_BLUETOOTH_AUDIO_CODEC_MSBC,
+ 		SPA_BLUETOOTH_AUDIO_CODEC_CVSD,
++		SPA_BLUETOOTH_AUDIO_CODEC_SSC,
+ 	};
+ 	size_t i;
+ 	for (i = 0; i < SPA_N_ELEMENTS(order); ++i)
+@@ -184,6 +185,7 @@ const struct media_codec * const *load_media_codecs(struct spa_plugin_loader *lo
+ 		MEDIA_CODEC_FACTORY_LIB("aptx"),
+ 		MEDIA_CODEC_FACTORY_LIB("faststream"),
+ 		MEDIA_CODEC_FACTORY_LIB("ldac"),
++		MEDIA_CODEC_FACTORY_LIB("ssc"),
+ 		MEDIA_CODEC_FACTORY_LIB("sbc"),
+ 		MEDIA_CODEC_FACTORY_LIB("lc3plus"),
+ 		MEDIA_CODEC_FACTORY_LIB("opus"),
+diff --git a/spa/plugins/bluez5/defs.h b/spa/plugins/bluez5/defs.h
+index 5e69bb7..c9ad503 100644
+--- a/spa/plugins/bluez5/defs.h
++++ b/spa/plugins/bluez5/defs.h
+@@ -635,7 +635,7 @@ enum spa_bt_transport_state {
+ };
+ 
+ struct spa_bt_transport_events {
+-#define SPA_VERSION_BT_TRANSPORT_EVENTS	0
++#define SPA_VERSION_BT_TRANSPORT_EVENTS	1
+ 	uint32_t version;
+ 
+ 	void (*destroy) (void *data);
+@@ -643,6 +643,8 @@ struct spa_bt_transport_events {
+ 	void (*state_changed) (void *data, enum spa_bt_transport_state old,
+ 			enum spa_bt_transport_state state);
+ 	void (*volume_changed) (void *data);
++	/** The node using the transport will be removed */
++	void (*remove_node) (void *data);
+ };
+ 
+ struct spa_bt_transport_implementation {
+@@ -744,6 +746,7 @@ int spa_bt_transport_ensure_sco_io(struct spa_bt_transport *t, struct spa_loop *
+ #define spa_bt_transport_emit_delay_changed(t)		spa_bt_transport_emit(t, delay_changed, 0)
+ #define spa_bt_transport_emit_state_changed(t,...)	spa_bt_transport_emit(t, state_changed, 0, __VA_ARGS__)
+ #define spa_bt_transport_emit_volume_changed(t)		spa_bt_transport_emit(t, volume_changed, 0)
++#define spa_bt_transport_emit_remove_node(t)		spa_bt_transport_emit(t, remove_node, 1)
+ 
+ #define spa_bt_transport_add_listener(t,listener,events,data) \
+         spa_hook_list_append(&(t)->listener_list, listener, events, data)
+diff --git a/spa/plugins/bluez5/media-sink.c b/spa/plugins/bluez5/media-sink.c
+index 15998a4..1903c79 100644
+--- a/spa/plugins/bluez5/media-sink.c
++++ b/spa/plugins/bluez5/media-sink.c
+@@ -2441,6 +2441,9 @@ static int do_transport_destroy(struct spa_loop *loop,
+ 				void *user_data)
+ {
+ 	struct impl *this = user_data;
++
++	if (this->transport)
++		spa_hook_remove(&this->transport_listener);
+ 	this->transport = NULL;
+ 	return 0;
+ }
+@@ -2452,6 +2455,15 @@ static void transport_destroy(void *data)
+ 	spa_loop_locked(this->data_loop, do_transport_destroy, 0, NULL, 0, this);
+ }
+ 
++static void transport_remove_node(void *data)
++{
++	struct impl *this = data;
++
++	spa_log_debug(this->log, "transport %p remove node", this->transport);
++	do_stop(this);
++	spa_loop_locked(this->data_loop, do_transport_destroy, 0, NULL, 0, this);
++}
++
+ static void transport_state_changed(void *data,
+ 	enum spa_bt_transport_state old,
+ 	enum spa_bt_transport_state state)
+@@ -2499,6 +2511,7 @@ static const struct spa_bt_transport_events transport_events = {
+ 	.delay_changed = transport_delay_changed,
+ 	.state_changed = transport_state_changed,
+ 	.destroy = transport_destroy,
++	.remove_node = transport_remove_node,
+ };
+ 
+ static int impl_get_interface(struct spa_handle *handle, const char *type, void **interface)
+diff --git a/spa/plugins/bluez5/media-source.c b/spa/plugins/bluez5/media-source.c
+index e1c01d9..d102501 100644
+--- a/spa/plugins/bluez5/media-source.c
++++ b/spa/plugins/bluez5/media-source.c
+@@ -2067,6 +2067,9 @@ static int do_transport_destroy(struct spa_loop *loop,
+ 				void *user_data)
+ {
+ 	struct impl *this = user_data;
++
++	if (this->transport)
++		spa_hook_remove(&this->transport_listener);
+ 	this->transport = NULL;
+ 	return 0;
+ }
+@@ -2078,11 +2081,21 @@ static void transport_destroy(void *data)
+ 	spa_loop_locked(this->data_loop, do_transport_destroy, 0, NULL, 0, this);
+ }
+ 
++static void transport_remove_node(void *data)
++{
++	struct impl *this = data;
++
++	spa_log_debug(this->log, "transport %p remove node", this->transport);
++	do_stop(this);
++	spa_loop_locked(this->data_loop, do_transport_destroy, 0, NULL, 0, this);
++}
++
+ static const struct spa_bt_transport_events transport_events = {
+ 	SPA_VERSION_BT_TRANSPORT_EVENTS,
+ 	.delay_changed = transport_delay_changed,
+ 	.state_changed = transport_state_changed,
+         .destroy = transport_destroy,
++	.remove_node = transport_remove_node,
+ };
+ 
+ static int impl_get_interface(struct spa_handle *handle, const char *type, void **interface)
+diff --git a/spa/plugins/bluez5/meson.build b/spa/plugins/bluez5/meson.build
+index 01c5f3a..5049d15 100644
+--- a/spa/plugins/bluez5/meson.build
++++ b/spa/plugins/bluez5/meson.build
+@@ -81,6 +81,8 @@ bluez5lib = shared_library('spa-bluez5',
+   install_dir : spa_plugindir / 'bluez5')
+ 
+ codec_args = [ '-DCODEC_PLUGIN' ]
++sscenc_inc = include_directories('sscenc/include')
++ssc_codec_args = codec_args + [ '-DSSCENC_BLOB_HELPER="/home/asael/.local/libexec/sscenc/sscenc-blob-run"' ]
+ 
+ bluez_codec_sbc = shared_library('spa-codec-bluez5-sbc',
+   [ 'a2dp-codec-sbc.c', 'media-codecs.c' ],
+@@ -90,6 +92,14 @@ bluez_codec_sbc = shared_library('spa-codec-bluez5-sbc',
+   install : true,
+   install_dir : spa_plugindir / 'bluez5')
+ 
++bluez_codec_ssc = shared_library('spa-codec-bluez5-ssc',
++  [ 'a2dp-codec-ssc.c', 'sscenc/encoder.c', 'media-codecs.c' ],
++  include_directories : [ configinc, sscenc_inc ],
++  c_args : ssc_codec_args,
++  dependencies : [ spa_dep ],
++  install : true,
++  install_dir : spa_plugindir / 'bluez5')
++
+ bluez_codec_faststream = shared_library('spa-codec-bluez5-faststream',
+   [ 'a2dp-codec-faststream.c', 'media-codecs.c' ],
+   include_directories : [ configinc ],
+diff --git a/spa/plugins/bluez5/sscenc/encoder.c b/spa/plugins/bluez5/sscenc/encoder.c
+new file mode 100644
+index 0000000..12e0431
+--- /dev/null
++++ b/spa/plugins/bluez5/sscenc/encoder.c
+@@ -0,0 +1,544 @@
++#include "ssc/encoder.h"
++
++#include <stdlib.h>
++#include <string.h>
++
++#ifdef SSCENC_BLOB_HELPER
++#include <errno.h>
++#include <signal.h>
++#include <stdio.h>
++#include <sys/types.h>
++#include <sys/wait.h>
++#include <unistd.h>
++#endif
++
++#define SSCENC_BLOB_MAX_FRAME_SAMPLES 8192u
++
++struct sscenc_encoder {
++    sscenc_config cfg;
++    uint16_t seq;
++    uint8_t flags;
++    int32_t pred[SSCENC_MAX_CHANNELS];
++#ifdef SSCENC_BLOB_HELPER
++    int blob_in;
++    int blob_out;
++    pid_t blob_pid;
++    /* Samsung's encoder expects 24-bit audio at 2^29 full scale (as SSCOnWindows feeds it);
++     * PipeWire delivers S24_32 at 2^23, so samples are shifted up by 6 bits here. */
++    int32_t scaled[SSCENC_BLOB_MAX_FRAME_SAMPLES * SSCENC_MAX_CHANNELS];
++    unsigned input_shift; /* SSCENC_INPUT_SHIFT, default 6 (2^29) */
++#endif
++};
++
++static int supported_bitrate(uint32_t bitrate)
++{
++    switch (bitrate) {
++    case 88000:
++    case 96000:
++    case 128000:
++    case 192000:
++    case 229000:
++#ifdef SSCENC_BLOB_HELPER
++    case 152000:
++    case 250000:
++    case 256000:
++    case 291000:
++    case 308000:
++    case 328000:
++    case 442000:
++    case 512000:
++    case 584000:
++    case 768000:
++    case 886000:
++    case 990000:
++    case 1200000:
++    case 1411000:
++    case 2304000:
++    case 3200000:
++#endif
++        return 1;
++    default:
++        return 0;
++    }
++}
++
++int sscenc_header_for_bitrate(uint32_t bitrate, uint8_t *header)
++{
++    uint8_t h;
++
++    switch (bitrate) {
++    case 88000:  h = 0xf0; break;
++    case 96000:  h = 0xf1; break;
++    case 128000: h = 0xf2; break;
++    case 192000: h = 0xf3; break;
++    case 229000: h = 0xf4; break;
++    default:
++        return SSCENC_EINVAL;
++    }
++
++    if (header)
++        *header = h;
++    return SSCENC_OK;
++}
++
++int sscenc_config_basic(sscenc_config *cfg, uint32_t sample_rate, uint8_t channels, uint32_t bitrate)
++{
++    if (!cfg || (sample_rate != 44100 && sample_rate != 48000
++#ifdef SSCENC_BLOB_HELPER
++                 && sample_rate != 96000 /* UHQ, Samsung encoder only */
++#endif
++                 ) || channels == 0 || channels > SSCENC_MAX_CHANNELS || !supported_bitrate(bitrate))
++        return SSCENC_EINVAL;
++
++    cfg->sample_rate = sample_rate;
++    cfg->bitrate = bitrate;
++    cfg->channels = channels;
++    cfg->bits_per_sample = 34;
++    {
++        const char *benv = getenv("SSCENC_BITS");
++        if (benv) {
++            int bv = atoi(benv);
++            if (bv == 16 || bv == 24 || bv == 32 || bv == 34)
++                cfg->bits_per_sample = (uint8_t)bv;
++        }
++    }
++    return SSCENC_OK;
++}
++
++static uint32_t budget_rate(uint32_t sample_rate)
++{
++    return sample_rate == 48000 ? 44100u : sample_rate;
++}
++
++size_t sscenc_frame_bound(const sscenc_config *cfg, size_t frame_samples)
++{
++    uint64_t num;
++    size_t payload;
++    uint32_t rate;
++
++    if (!cfg || frame_samples == 0)
++        return 0;
++
++    rate = budget_rate(cfg->sample_rate);
++    if (rate == 44100 && frame_samples == SSCENC_FRAME_SAMPLES) {
++        switch (cfg->bitrate) {
++        case 88000:  return 224;
++        case 96000:  return 244;
++        case 128000: return 324;
++        case 192000: return 484;
++        case 229000: return 576;
++        default: break;
++        }
++    }
++
++    num = (uint64_t)cfg->bitrate * frame_samples;
++    payload = (size_t)((num + (uint64_t)rate * 8u - 1u) / ((uint64_t)rate * 8u));
++    payload = (payload + 5u) & ~(size_t)1u;
++    if (payload < 8)
++        payload = 8;
++    return payload + 4u;
++}
++
++#ifdef SSCENC_BLOB_HELPER
++static int write_full(int fd, const void *buf, size_t n)
++{
++    const uint8_t *p = buf;
++    while (n) {
++        ssize_t w = write(fd, p, n);
++        if (w < 0) {
++            if (errno == EINTR)
++                continue;
++            return -1;
++        }
++        p += (size_t)w;
++        n -= (size_t)w;
++    }
++    return 0;
++}
++
++static int read_full(int fd, void *buf, size_t n)
++{
++    uint8_t *p = buf;
++    while (n) {
++        ssize_t r = read(fd, p, n);
++        if (r == 0)
++            return -1;
++        if (r < 0) {
++            if (errno == EINTR)
++                continue;
++            return -1;
++        }
++        p += (size_t)r;
++        n -= (size_t)r;
++    }
++    return 0;
++}
++
++static void close_blob(sscenc_encoder *enc)
++{
++    if (enc->blob_in >= 0) {
++        close(enc->blob_in);
++        enc->blob_in = -1;
++    }
++    if (enc->blob_out >= 0) {
++        close(enc->blob_out);
++        enc->blob_out = -1;
++    }
++    if (enc->blob_pid > 0) {
++        int status;
++        pid_t pid;
++        do {
++            pid = waitpid(enc->blob_pid, &status, 0);
++        } while (pid < 0 && errno == EINTR);
++        enc->blob_pid = -1;
++    }
++}
++
++static int start_blob(sscenc_encoder *enc)
++{
++    int in_pipe[2] = {-1, -1};
++    int out_pipe[2] = {-1, -1};
++    char rate[16], channels[8], bits[8], bitrate[16];
++
++    snprintf(rate, sizeof(rate), "%u", enc->cfg.sample_rate);
++    snprintf(channels, sizeof(channels), "%u", enc->cfg.channels);
++    snprintf(bits, sizeof(bits), "%u", enc->cfg.bits_per_sample);
++    snprintf(bitrate, sizeof(bitrate), "%u", enc->cfg.bitrate);
++
++    if (pipe(in_pipe) < 0 || pipe(out_pipe) < 0)
++        goto fail;
++
++    pid_t pid = fork();
++    if (pid < 0)
++        goto fail;
++    if (pid == 0) {
++        (void)dup2(in_pipe[0], STDIN_FILENO);
++        (void)dup2(out_pipe[1], STDOUT_FILENO);
++        close(in_pipe[0]);
++        close(in_pipe[1]);
++        close(out_pipe[0]);
++        close(out_pipe[1]);
++        execl(SSCENC_BLOB_HELPER, SSCENC_BLOB_HELPER, rate, channels, bits, bitrate, (char *)NULL);
++        _exit(127);
++    }
++
++    close(in_pipe[0]);
++    close(out_pipe[1]);
++    enc->blob_in = in_pipe[1];
++    enc->blob_out = out_pipe[0];
++    enc->blob_pid = pid;
++    int32_t ready = -1;
++    if (read_full(enc->blob_out, &ready, sizeof(ready)) < 0 || ready != 0) {
++        close_blob(enc);
++        return -1;
++    }
++
++    return 0;
++
++fail:
++    if (in_pipe[0] >= 0) close(in_pipe[0]);
++    if (in_pipe[1] >= 0) close(in_pipe[1]);
++    if (out_pipe[0] >= 0) close(out_pipe[0]);
++    if (out_pipe[1] >= 0) close(out_pipe[1]);
++    return -1;
++}
++
++static int restart_blob(sscenc_encoder *enc)
++{
++    close_blob(enc);
++    return start_blob(enc);
++}
++#endif
++
++sscenc_encoder *sscenc_create(const sscenc_config *cfg)
++{
++    sscenc_encoder *enc;
++
++    if (!cfg || (cfg->bits_per_sample != 24 && cfg->bits_per_sample != 32 && cfg->bits_per_sample != 34
++                 && cfg->bits_per_sample != 16) || (cfg->sample_rate != 44100 && cfg->sample_rate != 48000
++#ifdef SSCENC_BLOB_HELPER
++                 && cfg->sample_rate != 96000
++#endif
++                 ) || cfg->channels == 0 || cfg->channels > SSCENC_MAX_CHANNELS || !supported_bitrate(cfg->bitrate))
++        return NULL;
++
++    enc = (sscenc_encoder *)calloc(1, sizeof(*enc));
++    if (!enc)
++        return NULL;
++
++    enc->cfg = *cfg;
++    enc->flags = 1;
++#ifdef SSCENC_BLOB_HELPER
++    enc->blob_in = -1;
++    enc->blob_out = -1;
++    enc->blob_pid = -1;
++    {
++        const char *sh = getenv("SSCENC_INPUT_SHIFT");
++        enc->input_shift = (sh && *sh >= '0' && *sh <= '8' && sh[1] == '\0') ? (unsigned)(*sh - '0') : 6u;
++    }
++    if (start_blob(enc) < 0) {
++        free(enc);
++        return NULL;
++    }
++#endif
++    return enc;
++}
++
++void sscenc_destroy(sscenc_encoder *enc)
++{
++    if (!enc)
++        return;
++#ifdef SSCENC_BLOB_HELPER
++    close_blob(enc);
++#endif
++    free(enc);
++}
++
++void sscenc_reset(sscenc_encoder *enc)
++{
++    if (!enc)
++        return;
++    enc->seq = 0;
++    enc->flags = 1;
++    enc->pred[0] = 0;
++    enc->pred[1] = 0;
++#ifdef SSCENC_BLOB_HELPER
++    (void)restart_blob(enc);
++#endif
++}
++
++static void put_nibble(uint8_t *p, size_t idx, uint8_t v)
++{
++    if (idx & 1u)
++        p[idx >> 1] = (uint8_t)(p[idx >> 1] | (v & 0x0f));
++    else
++        p[idx >> 1] = (uint8_t)((v & 0x0f) << 4);
++}
++
++static int32_t clamp_i32(int64_t v, int32_t lo, int32_t hi)
++{
++    if (v < lo)
++        return lo;
++    if (v > hi)
++        return hi;
++    return (int32_t)v;
++}
++
++static unsigned scale_shift(const int16_t *pcm, size_t samples)
++{
++    uint32_t peak = 0;
++
++    for (size_t i = 0; i < samples; ++i) {
++        int32_t s = pcm[i];
++        uint32_t a = (uint32_t)(s < 0 ? -s : s);
++        if (a > peak)
++            peak = a;
++    }
++
++    if (peak == 0)
++        return 0;
++
++    unsigned shift = 8;
++    while (shift > 0 && (peak >> shift) < 7)
++        --shift;
++    return shift;
++}
++
++static void write_payload(sscenc_encoder *enc, const int16_t *pcm, size_t frames, uint8_t *payload, size_t payload_len)
++{
++    const size_t channels = enc->cfg.channels;
++    const size_t total = frames * channels;
++    const size_t body = payload_len > 4 ? payload_len - 4 : 0;
++    const size_t symbols = body * 2;
++    unsigned shift;
++    size_t group;
++
++    memset(payload, 0, payload_len);
++    if (payload_len >= 2) {
++        payload[0] = 0xff;
++        payload[1] = 0xfe;
++    }
++    if (!pcm || total == 0 || symbols == 0)
++        return;
++
++    shift = scale_shift(pcm, total);
++    if (shift == 0)
++        return;
++
++    payload[2] = (uint8_t)((shift << 4) | channels);
++    payload[3] = (uint8_t)(frames >> 1);
++    group = (total + symbols - 1u) / symbols;
++    if (group == 0)
++        group = 1;
++
++    for (size_t sym = 0, pos = 0; sym < symbols && pos < total; ++sym, pos += group) {
++        int64_t acc = 0;
++        size_t n = group;
++        if (pos + n > total)
++            n = total - pos;
++        for (size_t i = 0; i < n; ++i)
++            acc += pcm[pos + i];
++
++        const size_t ch = pos % channels;
++        int32_t avg = (int32_t)(acc / (int64_t)n);
++        int32_t delta = (avg - enc->pred[ch]) >> shift;
++        delta = clamp_i32(delta, -8, 7);
++        enc->pred[ch] += delta << shift;
++        put_nibble(payload + 4, sym, (uint8_t)(delta & 0x0f));
++    }
++}
++
++static int encode_fake_s16(sscenc_encoder *enc,
++                           const int16_t *pcm,
++                           size_t frame_samples,
++                           uint8_t *out,
++                           size_t out_cap,
++                           size_t *written)
++{
++    uint8_t hdr;
++    size_t frame_len;
++
++    if (written)
++        *written = 0;
++    if (!enc || !pcm || !out || frame_samples == 0)
++        return SSCENC_EINVAL;
++
++    frame_len = sscenc_frame_bound(&enc->cfg, frame_samples);
++    if (out_cap < frame_len)
++        return SSCENC_ENOSPC;
++    if (sscenc_header_for_bitrate(enc->cfg.bitrate, &hdr) != SSCENC_OK)
++        return SSCENC_EINVAL;
++
++    out[0] = 0xff;
++    out[1] = 0xee;
++    out[2] = (uint8_t)(((enc->seq & 0x0f) << 4) | (enc->flags & 0x03));
++    out[3] = hdr;
++
++    write_payload(enc, pcm, frame_samples, out + 4, frame_len - 4);
++
++    enc->seq = (uint16_t)((enc->seq + 1u) & 0xffu);
++    if (written)
++        *written = frame_len;
++    return SSCENC_OK;
++}
++
++#ifdef SSCENC_BLOB_HELPER
++static int drain_blob_frame(sscenc_encoder *enc, size_t n)
++{
++    uint8_t buf[256];
++    while (n) {
++        size_t chunk = n < sizeof(buf) ? n : sizeof(buf);
++        if (read_full(enc->blob_out, buf, chunk) < 0)
++            return -1;
++        n -= chunk;
++    }
++    return 0;
++}
++
++static int encode_blob_s32(sscenc_encoder *enc,
++                           const int32_t *pcm,
++                           size_t frame_samples,
++                           uint8_t *out,
++                           size_t out_cap,
++                           size_t *written)
++{
++    uint32_t frame_count;
++    int32_t ret;
++    size_t pcm_bytes;
++
++    if (written)
++        *written = 0;
++    if (!enc || !pcm || !out || frame_samples == 0 || frame_samples > UINT32_MAX)
++        return SSCENC_EINVAL;
++    if (enc->blob_in < 0 || enc->blob_out < 0)
++        return SSCENC_EINVAL;
++    if (frame_samples > SSCENC_BLOB_MAX_FRAME_SAMPLES)
++        return SSCENC_EINVAL;
++
++    frame_count = (uint32_t)frame_samples;
++    for (size_t i = 0; i < frame_samples * (size_t)enc->cfg.channels; ++i)
++        enc->scaled[i] = clamp_i32((int64_t)(((int32_t)((uint32_t)pcm[i] << 8)) >> 8) * ((int64_t)1 << enc->input_shift),
++                                   INT32_MIN, INT32_MAX);
++    pcm_bytes = frame_samples * (size_t)enc->cfg.channels * sizeof(*pcm);
++    if (write_full(enc->blob_in, &frame_count, sizeof(frame_count)) < 0 ||
++        write_full(enc->blob_in, enc->scaled, pcm_bytes) < 0)
++        return SSCENC_EINVAL;
++    if (read_full(enc->blob_out, &ret, sizeof(ret)) < 0)
++        return SSCENC_EINVAL;
++    if (ret < 0)
++        return SSCENC_EINVAL;
++    if ((size_t)ret > out_cap) {
++        if (drain_blob_frame(enc, (size_t)ret) < 0)
++            return SSCENC_EINVAL;
++        return SSCENC_ENOSPC;
++    }
++    if (ret > 0 && read_full(enc->blob_out, out, (size_t)ret) < 0)
++        return SSCENC_EINVAL;
++
++    if (written)
++        *written = (size_t)ret;
++    return SSCENC_OK;
++}
++#endif
++
++int sscenc_encode_s32(sscenc_encoder *enc,
++                      const int32_t *pcm,
++                      size_t frame_samples,
++                      uint8_t *out,
++                      size_t out_cap,
++                      size_t *written)
++{
++#ifdef SSCENC_BLOB_HELPER
++    return encode_blob_s32(enc, pcm, frame_samples, out, out_cap, written);
++#else
++    int16_t *tmp;
++    size_t total;
++    int ret;
++
++    if (written)
++        *written = 0;
++    if (!enc || !pcm || frame_samples == 0)
++        return SSCENC_EINVAL;
++
++    total = frame_samples * (size_t)enc->cfg.channels;
++    tmp = (int16_t *)malloc(total * sizeof(*tmp));
++    if (!tmp)
++        return SSCENC_ENOMEM;
++    for (size_t i = 0; i < total; ++i)
++        tmp[i] = (int16_t)clamp_i32((int64_t)pcm[i] >> 14, -32768, 32767);
++    ret = encode_fake_s16(enc, tmp, frame_samples, out, out_cap, written);
++    free(tmp);
++    return ret;
++#endif
++}
++
++int sscenc_encode_s16(sscenc_encoder *enc,
++                      const int16_t *pcm,
++                      size_t frame_samples,
++                      uint8_t *out,
++                      size_t out_cap,
++                      size_t *written)
++{
++#ifdef SSCENC_BLOB_HELPER
++    int32_t *tmp;
++    size_t total;
++    int ret;
++
++    if (written)
++        *written = 0;
++    if (!enc || !pcm || frame_samples == 0)
++        return SSCENC_EINVAL;
++
++    total = frame_samples * (size_t)enc->cfg.channels;
++    tmp = (int32_t *)malloc(total * sizeof(*tmp));
++    if (!tmp)
++        return SSCENC_ENOMEM;
++    for (size_t i = 0; i < total; ++i)
++        tmp[i] = (int32_t)pcm[i] << 14;
++    ret = encode_blob_s32(enc, tmp, frame_samples, out, out_cap, written);
++    free(tmp);
++    return ret;
++#else
++    return encode_fake_s16(enc, pcm, frame_samples, out, out_cap, written);
++#endif
++}
+diff --git a/spa/plugins/bluez5/sscenc/include/ssc/encoder.h b/spa/plugins/bluez5/sscenc/include/ssc/encoder.h
+new file mode 100644
+index 0000000..7de77d6
+--- /dev/null
++++ b/spa/plugins/bluez5/sscenc/include/ssc/encoder.h
+@@ -0,0 +1,58 @@
++#ifndef SSCENC_ENCODER_H
++#define SSCENC_ENCODER_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* S948BXXS3AZF4 phone captures send one 484-byte SSC frame per RTP packet at
++ * 192 kbps basic SSC. The Samsung blob returns that size for 864 PCM frames;
++ * 480-frame calls produce shorter packets that do not match the phone path. */
++#define SSCENC_FRAME_SAMPLES 864u
++#define SSCENC_MAX_CHANNELS 2u
++
++typedef enum {
++    SSCENC_OK = 0,
++    SSCENC_EINVAL = -1,
++    SSCENC_ENOSPC = -2,
++    SSCENC_ENOMEM = -3
++} sscenc_status;
++
++typedef struct {
++    uint32_t sample_rate;
++    uint32_t bitrate;
++    uint8_t channels;
++    uint8_t bits_per_sample;
++} sscenc_config;
++
++typedef struct sscenc_encoder sscenc_encoder;
++
++int sscenc_config_basic(sscenc_config *cfg, uint32_t sample_rate, uint8_t channels, uint32_t bitrate);
++int sscenc_header_for_bitrate(uint32_t bitrate, uint8_t *header);
++size_t sscenc_frame_bound(const sscenc_config *cfg, size_t frame_samples);
++
++sscenc_encoder *sscenc_create(const sscenc_config *cfg);
++void sscenc_destroy(sscenc_encoder *enc);
++void sscenc_reset(sscenc_encoder *enc);
++
++int sscenc_encode_s16(sscenc_encoder *enc,
++                      const int16_t *pcm,
++                      size_t frame_samples,
++                      uint8_t *out,
++                      size_t out_cap,
++                      size_t *written);
++int sscenc_encode_s32(sscenc_encoder *enc,
++                      const int32_t *pcm,
++                      size_t frame_samples,
++                      uint8_t *out,
++                      size_t out_cap,
++                      size_t *written);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
