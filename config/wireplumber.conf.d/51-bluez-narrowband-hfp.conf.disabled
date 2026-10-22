@@ -1,0 +1,6 @@
+# Workaround: HFP mic dies after profile switches (orphaned eSCO link) with
+# mSBC/LC3-SWB on Intel adapters. Keep only narrowband CVSD for calls.
+# https://github.com/bluez/bluez/issues/2545
+monitor.bluez.properties = {
+  bluez5.codecs = [ sbc sbc_xq aac cvsd ]
+}
