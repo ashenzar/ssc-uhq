@@ -1,0 +1,8 @@
+# Working files (large disassembly, binary symlinks)
+work/
+# Python cache
+__pycache__/
+*.pyc
+# Editor backups
+*~
+*.swp
