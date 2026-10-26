@@ -23,6 +23,10 @@ the same. The rebuild pays off in three ways:
    decodable by the buds' firmware. This is how libopus improved quality over the years
    without changing its bitstream.
 
+## Progress (2026-10-26, end of batch 2)
+~52% of the encoder's live code bytes are verified bit-exact (31 difftest tests, patches
+0001–0008). The phase is ~25–30% done, weighted by objective (F33, last paragraph).
+
 ## Objectives
 
 **O0. Rule out the cheap explanations first (D32)**
@@ -38,14 +42,14 @@ the same. The rebuild pays off in three ways:
 - [x] T1.1 Identify lineage: fixed-point CELT from libopus with an `ssc_` prefix (F27).
 - [x] T1.2 Pin the libopus version: **v1.1** (range 1.1-rc … 1.1 final; these can't be
       told apart in this binary). See F29. Clone at `~/src/opus`.
-- [~] T1.3 (first pass done, F30; "?" rows await O2 diff tests) Classify every exported function as **stock**, **modified** or
+- [~] T1.3 (F30 first pass; F31/F33 settle every "?" row except fft/mdct) Classify every exported function as **stock**, **modified** or
       **Samsung-only**, with evidence. Expected Samsung-only: DRC (`SSC_DRC_*`,
       `CalculateLimitGain`, `Biquad_Narrow_int2int_stereo`, `powercalc`), headroom
       (`normal_headroom`, `uhq_headroom`, `headroom_process`, `headroom_gain`), framing
       (`get_header_from_bitrate`, `set_data_header`, `set_data_frame_header`,
       `get_uhq_info_from_bitrate`, `set_limit_gain_from_bitrate`), 22nd band
       (`*_lastband*`, `last_band_info_calc`), `tone_detect`, pitch/prefilter gain helpers.
-- [ ] T1.4 Decode the remaining `CELTMode` fields for both modes (alloc vectors, logN,
+- [x] T1.4 *(F33.1: +0x28/+0x30 alloc tables, +0x38 logN, +0x58 Q31 trig, int32 caps; window is a Q31 global)* Decode the remaining `CELTMode` fields for both modes (alloc vectors, logN,
       window, MDCT twiddles, PulseCache) and confirm the struct layout against libopus.
 
 **O2. Differential test harness (D31)**
@@ -75,12 +79,12 @@ the same. The rebuild pays off in three ways:
 Bottom-up. Each step passes its per-function vectors before the next starts:
 - [x] T4.1 *(bit-exact via libopus + patches 0001/0002, F31)* Range coder (`ec_enc_*`, `ec_laplace_encode`) and fixed-point math (`frac_div32`,
       `rcp`, `rsqrt_norm`, `sqrt`, `bitexact_cos`, `amp2Log2`, `smull32`).
-- [ ] T4.2 FFT/MDCT (`ssc_fft`, `mdct_forward`) with Samsung's 1728-point twiddles.
-- [ ] T4.3 Band energy, normalisation and the 22nd band.
-- [ ] T4.4 Energy quantisation (coarse, fine, finalise) and `ssc_eMeans_tmp`.
-- [ ] T4.5 Allocation (`compute_allocation`, alloc vectors, PulseCache) and PVQ
+- [ ] T4.2 *(next: Samsung rewrite, Q31 window/trig, F33.8; tables are formula-generated)* FFT/MDCT (`ssc_fft`, `mdct_forward`) with Samsung's 1728-point twiddles.
+- [~] T4.3 *(band energies, normalise, amp2Log2 bit-exact; 22nd-band energies `compute_band_energies_for_lastband` and the adaptive-end loop F33.7 remain)* Band energy, normalisation and the 22nd band.
+- [x] T4.4 *(coarse with 0006, fine, finalise; eMeans is stock, F33)* Energy quantisation (coarse, fine, finalise) and `ssc_eMeans_tmp`.
+- [x] T4.5 *(compute_allocation F, quant_all_bands with 0007, PVQ/theta/intensity; the 48k cache quirk F33.2 is carried through)* Allocation (`compute_allocation`, alloc vectors, PulseCache) and PVQ
       (`alg_quant`, `encode_pulses`, `quant_all_bands`, `stereo_itheta`, `haar1`).
-- [ ] T4.6 Analysis: transient, tf_select, spreading, hysteresis, pitch
+- [~] T4.6 *(pitch downsample/xcorr/remove_doubling, spreading 0005, comb filter 0008 done; transient, tf, dynalloc, pitch_search+tone_detect, patch_transient_decision remain)* Analysis: transient, tf_select, spreading, hysteresis, pitch
       (downsample/search/remove_doubling/xcorr), comb-filter prefilter.
 - [ ] T4.7 Samsung pre-processing: headroom and DRC/limiter (`uhq_headroom`,
       `normal_headroom`, `SSC_DRC_Exe`, biquad).
@@ -122,35 +126,42 @@ Bottom-up. Each step passes its per-function vectors before the next starts:
 - Committing Samsung code, binaries or data tables to this repo (D28).
 - Upstreaming to openssc, libopus or PipeWire.
 
-## Open decisions (as of 2026-10-26, end of O2 batch 1)
+## Open decisions (as of 2026-10-26, end of O2 batch 2)
 
 Settled this phase (logged here; promote to D-entries when convenient):
 OD2 → `~/src/ssc-codec` · OD3 → libopus `v1.1` submodule + patch series `harness/patches/` ·
-OD5 → Ghidra 12.2 at `~/.local/opt/ghidra` · OD6 → Vinchethescript `encoder.c` not used
-(our Ghidra output plus difftest replaced it) · OD11 → docs committed.
+OD5 → Ghidra 12.2 at `~/.local/opt/ghidra` · OD6 → Vinchethescript `encoder.c` not used ·
+OD11 → docs committed · OD13 → reference CELTMode built from the blob at runtime (done,
+F33) · OD14 → test against stock C first, transcribe on mismatch (comb_filter needed it:
+0008) · OD16 → patch series (0001–0008).
 
 Still open:
 
 | # | Question | Options | Recommendation |
 |---|---|---|---|
 | OD1 | When to run O0 (qemu deadline / Wi-Fi coexistence / artifact classification)? | before more RE / in parallel / after | **In parallel, at the next listening session.** It's cheap and needs the user on the buds. Still the only way to know whether the 96k noise is timing or codec. |
-| OD4 | Implementation language and numeric model | C fixed-point / C float / Rust | **C, `FIXED_POINT`**. Now more strongly supported: the rebuild *is* libopus v1.1 + patches (F31). |
-| OD7 | Samsung tables (D28): how does the code get them? | build-time extraction script → generated header (gitignored) / runtime load from the blob | **Both, by stage.** The harness reads them at runtime from the dlopened blob (batch 2). The native rebuild uses a build-time `tools/extract_tables.py <blob>` → `tables.h`. |
-| OD8 | Process-global state (F28.3, F31: `in_shared` iy/y, yy_lookup, `pre`, DRC, headroom, `previous_uhq_index`) | replicate globals / move into the handle | **Move into the handle**, bit-exact for the single-instance fresh-process case PipeWire uses. Before deciding, confirm which globals *carry state across frames* (DRC/headroom/previous_uhq_index) vs scratch (iy/y/yy_lookup). |
+| OD4 | Implementation language and numeric model | C fixed-point / C float / Rust | **C, `FIXED_POINT`.** Now 8 patches on v1.1 and still all integer (F33). |
+| OD7 | Samsung tables (D28): how does the code get them? | build-time extraction → generated header (gitignored) / runtime load from the blob | **Both, by stage**, but narrower now (see OD17). Only eBands, the two alloc tables and the PulseCache need extraction. |
+| OD8 | Process-global state | replicate globals / move into the handle | **Move into the handle.** F33.6 lists the encoder-struct fields found so far. Still to confirm which globals carry state across frames (DRC/headroom/previous_uhq_index) vs scratch. |
 | OD9 | Decoder acceptance without a reference decoder | no-desync + SNR / + listening | **Both** (unchanged). |
-| OD10 | Test-corpus music, especially the 96k tracks with the artifact | user's call | **User to name tracks.** Needed for O2 T2.2 golden frames and O3. |
-| OD12 | Patch 0004 is code-read only (no input changes the output) | keep / drop / keep + hunt for a discriminating input | **Keep**, flagged in F31. Revisit if a whole-frame mismatch ever points at remove_doubling. |
-| OD13 | Batch 2 (mode-dependent functions): how to build a libopus `CELTMode` for the reference | from the blob's static mode at runtime (decodes the F28.2 layout) / hand-transcribed tables | **From the blob at runtime.** It also verifies the F28.2 layout, and nothing Samsung-derived gets committed. |
-| OD14 | NEON asm functions (`ssc_comb_filter_*_asm`, `ssc_amp2Log2_asm`, `ssc_bitexact_cos_asm`) | test vs stock C first / transcribe semantics first | **Test vs stock C first** (bitexact_cos_asm already matched); transcribe only on mismatch. |
-| OD15 | When to start the decoder (O3) | after batch 2 / now in parallel | **After batch 2.** The decoder needs the same mode tables and allocation code, and 0002 already tells us the entropy-layer change. |
-| OD16 | Shape of the rebuild's libopus delta | patch series (quilt-style) applied at build / fork branch in the submodule | **Patch series** (as now). Each Samsung delta stays reviewable and is tied to the test that proves it. |
+| OD10 | Test-corpus music, especially the 96k tracks with the artifact | user's call | **User to name tracks.** Needed for T2.2 golden frames and O3. |
+| OD12 | Patch 0004 and 0006's second hunk are code-read only | keep / drop | **Keep both**, flagged (F31, F33.9). 0006's 150-byte limit is unreachable (intra peaks ~80 B). |
+| OD15 | When to start the decoder (O3) | now / after T4.2 / after framing (T4.8) | **Now, starting with T3.1 header + adaptive end (F33.7).** Batch 2 delivered what the decoder needs: modes, alloc, 24-bit ec, 0007's band 21. The decoder's IMDCT need not be bit-exact, so T4.2 doesn't block it. |
+| OD17 | Formula-generated tables (Q31 window, win_square, Q31 trig, π/4N rotation) | generate in code / extract like the rest | **Generate in code.** All match the formula exactly (F33.1, F33.8). It's standard CELT math, so nothing Samsung-derived is needed. |
+| OD18 | Alloc-table selector (alloc `+0x180`: shared +0x28 vs per-mode +0x30) | — | **Find what sets it** when porting ssc_encode (T4.8). It probably depends on mode/UHQ tier. The decoder must make the same choice, so it's needed for O3 too. |
+| OD19 | 48k PulseCache band-20 quirk (F33.2) | keep / "fix" | **Keep** (bitstream compatibility). Never "fix" it in O6: the buds' decoder presumably has the same table. |
+| OD20 | amp2Log2 overflow at bandE ≥ 2^29 | ignore / reproduce blob wrap | **Decide in T4.7.** If headroom guarantees bandE < 2^29, ignore it. Otherwise patch to the blob's NEON wrap. |
+| OD21 | MDCT/FFT shape in the rebuild | patch mdct.c/kiss_fft.c / new `ssc_mdct.c` in the patch series | **New file**: it's a rewrite (Q31, own kfft state), not a delta. Test it against `ssc_mdct_forward` and `ssc_fft` via difftest. |
 
 ## Next-session checklist
-1. Batch 2 of difftest (OD13): construct `CELTMode` from `ssc_custom_mode_create(96000|48000)`
-   output; test compute_allocation, normalise_bands, compute_band_energies,
-   spreading_decision, amp2Log2 (+asm), quant_coarse/fine/finalise energy, comb_filter (+asm),
-   ssc_fft / mdct_forward, quant_all_bands family (incl. compute_qn check, F32.2).
-2. Resolve F28.2's unknown mode fields (+0x30/+0x38/+0x58) while building the CELTMode.
-3. Then the Samsung-only live code: DRC/limiter, normal/uhq headroom (T4.7, the main noise
-   suspect), compute_band_energies_for_lastband, tone_detect.
-4. OD1 / OD10 need the user: listening session and track list.
+1. **T4.2 MDCT/FFT** (F33.8): transcribe `ssc_mdct_forward` + `ssc_fft` (Q31, formula
+   tables, OD17/OD21). Difftest both shifts (0 and 3) on both modes.
+2. **T3.1 + F33.7**: read the frame-header logic and the last-band / adaptive-end loop
+   in ssc_encode (0xcf34–0xd114; header bytes 2–3), plus `compute_band_energies_for_lastband`
+   (difftest it). Then OD18 (what sets alloc `+0x180`).
+3. Start the O3 decoder (OD15): libopus v1.1 decoder + 0002 (24-bit ec) + 0007 (band 21)
+   + Samsung modes and cache quirk + header from item 2. First input:
+   `~/src/ssc-capture/uhq584_getlucky.frames`.
+4. Remaining live Samsung code: pitch_search + tone_detect, patch_transient_decision,
+   headroom (T4.7, main noise suspect, also OD20), DRC/limiter.
+5. OD1 / OD10 need the user: listening session and track list.

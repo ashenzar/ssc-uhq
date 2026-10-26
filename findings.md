@@ -962,3 +962,120 @@ it is global as well.
      `tools/fnmatch.py` splits them at Ghidra's `FUN_` boundaries.
    - The full difftest suite runs in ~1.5 s under qemu. The early "slow run" was the
      ec test spinning in the blob's `ec_enc_normalize` (ft > 2^15, item 4).
+
+## F33 Differential testing results, batch 2: mode-dependent functions (O2 / O4)
+
+Harness `~/src/ssc-codec/harness` (commits 22f572b, 78c4d6c, e76b53b). The reference
+`CELTMode` is built **at runtime** from `ssc_custom_mode_create(48000|96000)` (OD13),
+so nothing Samsung-derived sits in the source. **31/31 tests pass bit-exact** (~2 s under
+qemu). Every new patch fails on its own removal.
+
+**1. `CELTMode` layout resolved** (closes F28.2's unknowns, T1.4):
+
+| Off | Field | Evidence |
+|---|---|---|
+| +0x28 | allocVectors, **shared** 11×22 (0x3f5e) | selected when alloc-struct `+0x180` == 0 |
+| +0x30 | allocVectors, **per-mode** 11×22 (48k 0x4050, 96k 0x59b6) | selected when `+0x180` ≠ 0 |
+| +0x38 | logN (22 × int16) | equals `log2_frac(width, BITRES)` for every band, both modes |
+| +0x40 | mdct.n=1728, maxshift=3 | |
+| +0x48/+0x50 | mdct.kfft[2] (shift 0 and 3, shared) | `ssc_mdct_forward` picks `kfft[shift>>1]` |
+| +0x58 | mdct.trig: **Q31 int32**, 433 entries = `round(2^31·cos(2πk/1728))` | 433/433 exact |
+| +0x60..+0x78 | PulseCache size/index/bits/caps | bits and index from stock `compute_pulse_cache` (except item 2); **caps are int32 `init_caps(LM=3,C=2)` output** (`(caps+64)·C·N>>2`), not libopus' byte table |
+
+There's **no window field**. The MDCT window is a Q31 global at 0x3d80 equal to
+`round(2^31·w(i))` with CELT's window `w(i)=sin(π/2·sin²(π/2·(i+½)/108))` (108/108 exact).
+`win_square` (.data 0x1ff80, used by the comb filter) is `round(2^31·w(i)²)` computed in
+double (108/108). **All MDCT/window tables are formula-generated**, so the native rebuild
+can compute them instead of extracting them (OD17).
+
+Shared vs per-mode alloc: the shared table is the 48k per-mode table except for rows 8–10.
+The 96k per-mode table is very different (fewer bits above band 17, nonzero last
+columns in rows 5–10).
+
+2. **48k PulseCache quirk:** `cache.index[LM][band 20]` points to the **width-18** entry
+   (band 21's) at every LM (−1…3), although band 20 is 12 wide (72→84). It looks like a
+   cache generated for an older `…,72,90,108` layout and never regenerated. Every
+   bits2pulses on band 20 at 48k uses the wrong pulse table. That's self-consistent with
+   the buds only if their decoder has the same table. **The decoder (O3) and the rebuild
+   must keep it.** The 96k cache matches stock exactly.
+
+3. **Tables that are stock:** `ssc_eMeans_tmp` == eMeans; `e_prob_model[3][0/1]` (inter
+   0x5dbf, intra 0x5d91); `small_energy_icdf`; `ssc_tf_select_table` == stock row
+   LM=3 only (8 bytes); exp2_table8 (0x2760); LOG2_FRAC_TABLE (0x5df0).
+
+4. **Per-function results** (Samsung prototype → class):
+
+   | Function | Samsung signature | Class | Patch / note |
+   |---|---|---|---|
+   | compute_band_energies | (m, X, bandE, end), C=2, M=8 | F ✔ | |
+   | normalise_bands | (m, freq, X, bandE, end) | F ✔ | called **in place** (freq == X) |
+   | amp2Log2 | (m, n, bandE, bandLogE), channel stride n | F ✔ | NEON does band pairs, so n must be 22 |
+   | spreading_decision | (st, X, update_hf, end) | **M** ✔ | **0005**: hf weight 64, `hf_sum>>=3`, no narrow-band early return |
+   | quant_coarse_energy (+impl) | (m, –, end, eBands, oldE, budget, error, enc, nbAvailBytes, force_intra, &delayedIntra) | **M** ✔ | **0006**: loss_distortion over `C·end` contiguous entries; two_pass=1, loss_rate=0; 150-byte intra buffer (unreachable, item 9). impl is F (C=2, LM=3, lfe=0) |
+   | quant_fine_energy / quant_energy_finalise | stock minus start, C | F ✔ | |
+   | compute_allocation (+interp_bits2pulses inlined) | (st, alloc*, enc, end, signalBandwidth=end−1) | F ✔ | args packed in a frame struct (item 5); table selector `+0x180` |
+   | quant_all_bands (+quant_band, quant_partition/compute_theta, intensity_stereo, stereo_split inlined) | (m, end, X, cm, bandE, pulses, shortBlocks, spread, dual, intensity, tf_res, total, balance, ec, codedBands, &seed, 1) | **M** ✔ | **0007**: band 21 coded from its real data (stock redirects i ≥ effEBands to norm scratch). Y = X+864; norm scratch after Y |
+   | comb_filter (+5 NEON kernels) | (y, x, T0, T1, N, g0, g1, overlap) | **M** ✔ | **0008**: tapset 0 only; Q31 `win_square`; Q31 tap gains; one rounded 64-bit sum per sample |
+
+   Equivalent by construction (no patch needed): Samsung's quant_band has no
+   `lowband`/`LM`, but the v1.1 *encoder* never folds (`resynth = !encode`), so that is
+   dead-code removal. Samsung's stereo_split `(x·0xb504)>>16` equals stock's
+   `(x·23170)>>15` exactly. spreading_decision starting at band 8 is equivalent because
+   bands 0–7 are 1 bin wide in both modes. **F32.2 is confirmed:** compute_theta's
+   inlined compute_qn is stock, and quant_all_bands is bit-exact over 20k cases, so the
+   bitexact_cos divergence is unreachable.
+
+5. **Allocation frame struct** (`sp+0x3e0` in ssc_encode, passed to compute_allocation,
+   quant_fine/finalise, quant_all_bands): `+0x000` total, `+0x004` ebits[22], `+0x05c`
+   bits/pulses[22], `+0x0b8` cap ptr, `+0x0c0` offsets[22], `+0x118` fine_priority[22],
+   `+0x170` alloc_trim, `+0x174` dual_stereo, `+0x178` balance, `+0x180` alloc-table
+   selector.
+
+6. **Encoder-state offsets seen so far** (`st` = ssc_encode param_1; `*st` = mode):
+   `+0x10` force_intra, `+0x14` end, `+0x1c` rng (seed), `+0x20` spread_decision,
+   `+0x24` delayedIntra, `+0x28` tonal_average, `+0x2c` lastCodedBands, `+0x30`
+   hf_average, `+0x34` tapset_decision, `+0x50` intensity. This feeds OD8 and T4.8.
+
+7. **The coded band count varies per frame.** Allocation, coarse energy, spreading and
+   normalise get `end = st->end − w26`, where `w26 ∈ 0…3` comes from Samsung's last-band
+   energy loop (`compute_band_energies_for_lastband`, thresholds 12001 / 30001, ssc_encode
+   0xcf34–0xd114). The same loop rewrites frame-header bytes 2–3. So the 22nd band is
+   adaptive bandwidth signalled in the header. Needed for T3.1 (header parse) and T4.3.
+   Because of 0006, loss_distortion differs from stock whenever end < 22.
+
+8. **Samsung's MDCT is a rewrite** (`ssc_mdct_forward(l, in, out, overlap, shift,
+   stride)`, not yet tested). It has v1.1's structure (fold, pre-rotate with
+   `t[i<<shift]`/`t[(N4−i)<<shift]`, N/4 FFT, post-rotate), but with a Q31 window, Q31
+   trig, 64-bit products with rounding (`+2^30>>31`, NEON `rshrn`), and an exact
+   rotation by π/(4N) (`0x7fffff22/0xee4bb` for N=1728, `0x7fffc88c/0x7725c6` for 216)
+   instead of v1.1's small-angle `sine` correction. Only shifts 0 and 3 exist. It uses
+   `_pre_shared` and 0x212ac as scratch. `ssc_fft` (3404 B, radix 4/3 for 432/54) has a
+   custom compact state (24-byte kfft structs at 0x1bac0/0x1bad8).
+
+9. **Domain constraints added** (to F32.4):
+   - amp2Log2: `bandE < 2^29` (SHL32(bandE,2) overflows; both sides wrap differently).
+     Whether the encoder can reach it depends on headroom (T4.7).
+   - tf_res follows the block type: `{0,−2,0,−3}` long, `{3,0,1,−1}` transient. A
+     positive tf_change with B=1 makes B=0 and hangs exp_rotation (stock and blob).
+   - quant_coarse_energy: `error[]` beyond `end` is undefined (an uninitialised
+     error_intra copy on both sides). The intra pass peaks at ~80 bytes even for
+     extreme inputs, so 0006's 150-byte limit is unreachable (like 0004).
+   - quant_all_bands: X buffer ≥ 4·864 entries (norm scratch after Y).
+
+10. **Tooling:**
+    - `DT_WATCHDOG=<s>` (default 120 s per run via the Makefile) prints a backtrace;
+      resolve with `aarch64-linux-gnu-addr2line -f -i`. Batch-mode gdb over qemu's
+      gdbstub could not interrupt a running target, so the watchdog replaced it.
+    - Leaving a patch out: `make B=build/noN PATCHES="…"`.
+    - `pkill -f` self-matched again when the pattern and the qemu command shared one
+      shell line. Use `pidof qemu-aarch64`.
+    - Stock-run caveats: under `STOCK=1`, quant_all_bands hangs (band 21 is
+      quantised from uninitialised scratch) and is cut off by the watchdog.
+
+**Progress estimate (end of session, 2026-10-26).** By live encoder code bytes, 32.2 KB of
+62.4 KB (**~52%**) is verified bit-exact. Remaining: `ssc_encode` 16.6 KB (mostly inlined
+stock analysis: transient/tf/dynalloc/prefilter/VBR, plus framing), ssc_fft 3.4 KB,
+last-band energies 1.5 KB, headroom 2.7 KB, pitch_search + find_best_pitch 1.9 KB, mdct
+0.9 KB, DRC/limiter ~1.6 KB, patch_transient_decision 0.5 KB, tone_detect 0.4 KB,
+encoder_init/create 0.6 KB. Weighted by the Phase 4 objectives (O0 0%, O1 ~90%, O2 ~40%,
+O3 0%, O4 ~45%, O5/O6 0%), the phase is about **25–30%** done.
