@@ -897,3 +897,68 @@ entries each, in `in_shared` at 0x24dac / 0x24fec). The blob **crashes for band 
 N > 144**, which SSC never produces (widest band 18 << 3). remove_doubling's
 `yy_lookup` is also global. The prefilter buffer `pre` is reached through the GOT, so
 it is global as well.
+
+## F32 Session notes 2026-10-26 (loose findings from the O2 batch, not yet acted on)
+
+1. **Patch series vs upstream libopus** (checked against `~/src/opus` history):
+
+   | Patch | In later upstream? |
+   |---|---|
+   | 0001 exact `MULT32_32_Q31` | **Yes, identical expression.** `d6a44c55` (2015-11-20, `OPUS_FAST_INT64` flavours), shipped in 1.2 |
+   | 0002 `EC_CODE_BITS 24` | **No.** 32 in every release through 1.6.1. Samsung-only, bitstream-level |
+   | 0003 PVQ `Rxy²>>7`, 64-bit compare | **No.** 1.2–1.5.2 still `MULT16_16_Q15(Rxy,Rxy)`. Samsung-only |
+   | 0004 pitch-gain clamp | **Clamp only.** `ddea3a6f` (2016-06-18) adds `MIN32(g,Q15ONE)` inside a new `compute_pitch_gain()` with different (sx/sy) normalisation. The blob keeps 1.1's x2y2/rsqrt normalisation (bit-exact with 1.1 + 0001) plus the clamp. Samsung's own fix, not a backport |
+
+   Open question: did Samsung cherry-pick the 2015 `OPUS_FAST_INT64` commit, or write the
+   exact product themselves? Its other macros (`MULT16_32_Q15/Q16/P16`) are mathematically
+   identical to 1.1's, so this binary can't tell. The base is still 1.1 (F29:
+   `compute_band_energies` predates 1.1.1).
+
+2. **`bitexact_cos` divergence is unreachable** (F31 open point), *assuming Samsung's
+   compute_qn is stock*: v1.1 `compute_qn` asserts `qn ≤ 256` and even, so a nonzero
+   `itheta` is a multiple of 16384/qn ≥ 64, and the 0 / 16384 endpoints are special-cased
+   before bitexact_cos. Inputs < 64 or > 16320 never occur. To confirm when
+   `quant_partition` (FUN_00109460, compute_theta inlined) is tested in batch 2.
+
+3. **Equivalent-by-construction differences** (blob ≠ stock source, same output):
+   - alg_quant `pulsesLeft > N+3` fallback: the blob skips the two `yy` updates. They
+     are dead, because pulsesLeft becomes 0 and the search loop doesn't run.
+   - remove_doubling: the blob drops `MAX32(0, yy)` on `yy_lookup` (exact integer
+     sliding sums never go negative). Stock's `else if (T1<2*minperiod)` 0.9 threshold is
+     unreachable in both (T1<2·min implies T1<3·min).
+   - `MULT16_32_Q15(celt_rsqrt_norm(t), xy)` calls rsqrt_norm twice in both builds
+     (macro expands its argument twice). The paired calls in the blob are not a change.
+
+4. **Domain constraints the blob imposes** (every harness test must respect them, and
+   so must any future fuzzing of the native rebuild):
+   - range coder `ft ≤ 2^15` (24-bit state; larger loops forever in `ec_enc_normalize`)
+   - PVQ band size `N ≤ 144` (global `iy`/`y`, crash beyond), and (N,K) inside the PVQ
+     table (`pvq_ok` in difftest.c)
+   - `pitch_xcorr_c2`: len % 8 == 0, max_pitch % 4 == 0
+   - `pitch_downsample`: pre0/pre1 contiguous
+   - pitch_buf amplitude ≲ 2^11 (as pitch_downsample normalises). Louder input
+     overflows stock's 32-bit energies, which the blob does in 64-bit (0004)
+
+5. **Stock-build contrast** (`make STOCK=1 run`, 2000 iters): on pure v1.1, frac_div32,
+   lpc, stereo_itheta, remove_doubling, remove_doubling_loud, ec, encode_pulses and alg_quant
+   **fail**; everything else passes. Every failure is fixed by a specific patch. Caveat:
+   `pitch_downsample` passes even on stock although its internal `_celt_lpc` differs
+   without 0001, so that test is **not sensitive** to 0001.
+
+6. **Unexplained:** the first `pitch_downsample` test (two separate static arrays, the
+   blob reading 2·len from the first) **segfaulted**. With one contiguous buffer it passes.
+   Reading past the first array should land in the second, not fault. The cause is
+   unknown, and it's harmless for the encoder (its caller always passes contiguous
+   buffers).
+
+7. **Tooling lessons:**
+   - Ghidra's signature recovery is unreliable on NEON-heavy functions. For example,
+     `ssc_alg_quant` showed `undefined1[16]` vector "parameters", and calls to
+     `ssc_ec_enc_bits` dropped the `bits` argument. Ground truth for a prototype comes
+     from the function entry (`mov` of x0–x7) plus its call sites in `ssc_encode`.
+   - A heuristic "read-before-write" argument scanner was tried and dropped (it
+     misclassifies compares and pair loads).
+   - Unexported statics are folded into the previous symbol by objdump.
+     `tools/fnmatch.py` splits them at Ghidra's `FUN_` boundaries.
+   - The full difftest suite runs in ~1.5 s under qemu. The early "slow run" was the
+     ec test spinning in the blob's `ec_enc_normalize` (ft > 2^15, item 4).

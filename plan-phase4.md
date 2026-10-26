@@ -122,28 +122,35 @@ Bottom-up. Each step passes its per-function vectors before the next starts:
 - Committing Samsung code, binaries or data tables to this repo (D28).
 - Upstreaming to openssc, libopus or PipeWire.
 
-## Open decisions (to settle at the start of next session)
+## Open decisions (as of 2026-10-26, end of O2 batch 1)
 
-Each has a recommendation. Settle it, then record it as a D-entry in decisions.md.
+Settled this phase (logged here; promote to D-entries when convenient):
+OD2 → `~/src/ssc-codec` · OD3 → libopus `v1.1` submodule + patch series `harness/patches/` ·
+OD5 → Ghidra 12.2 at `~/.local/opt/ghidra` · OD6 → Vinchethescript `encoder.c` not used
+(our Ghidra output plus difftest replaced it) · OD11 → docs committed.
+
+Still open:
 
 | # | Question | Options | Recommendation |
 |---|---|---|---|
-| OD1 | Which first: O0 (timing/radio checks) or O1/O2 (version pin + harness)? | O0 first / O1–O2 first / both in parallel | **O0 first.** It takes about an hour and may reframe priorities. If clicks or dropouts show up, O5 (native) is the fix, not O6. |
-| OD2 *(done: `~/src/ssc-codec`)* | Where does the rebuild code live? | Inside `ssc-uhq/` / new private repo `~/src/ssc-codec` / fork of openssc | **New private repo** `~/src/ssc-codec`. The codec has its own build, tests and libopus base. `ssc-uhq` stays the investigation log (plans, decisions, findings). |
-| OD3 | How to bring in libopus? | git submodule pinned to the T1.2 version / vendored copy / fetch at build | **Submodule pinned to `v1.1`** (T1.2 done, F29; BSD-3). Samsung deltas go in separate files so they're easy to diff against upstream. |
-| OD4 | Implementation language and numeric model | C fixed-point (match blob) / C float / Rust | **C, `FIXED_POINT`**. Bit-exactness (D30) requires the same integer arithmetic. Float can be an O6 experiment later. |
-| OD5 | Decompiler | Install Ghidra (headless + GUI) / keep objdump + tools / rizin | **Done:** Ghidra 12.2 at `~/.local/opt/ghidra`. **Install Ghidra.** objdump was fine for Phases 1–3, but a 16 KB `ssc_encode` with inlined CELT needs decompiled pseudo-C to diff against libopus source. |
-| OD6 | Use the Vinchethescript `encoder.c`? | Ignore / navigation aid only / start from it | **Navigation aid only** (F28.6). It was built from a different binary, is unverified, and its author calls it broken. Our own Ghidra output on the S24U blob is the reference. |
-| OD7 | Table extraction (D28) | Python script → generated C header at build time / runtime load from the blob | **Build-time script** (`tools/extract_tables.py <blob> > tables.h`, gitignored output). Same pattern as the encoder: the user supplies the blob. |
-| OD8 | Global-state semantics (F28.3) | Replicate process globals exactly / move into the handle and accept non-bit-exactness with multiple instances | **Move state into the handle**, but bit-exact for the single-instance, fresh-process case, which is the only case PipeWire uses. Note the deviation. |
-| OD9 | Decoder acceptance without a reference decoder | No-desync + SNR threshold / also listen via a WAV render | **Both.** `ec_tell` must match the frame length exactly, SNR must be plausible per mode, and the user listens to the decoded WAV next to the source. |
-| OD10 | Test corpus music | Which tracks for the 3 music excerpts (44.1k-sourced + native 96k) | **User's call.** Include the 96k track(s) where the artifacts were heard (F28.9), plus "Get Lucky" for continuity with earlier phases. |
-| OD11 | Commit Phase 4 docs | Commit now / after OD answers | **Commit now** (plan + D27–D32 + F27–F28). Not yet committed as of this session. |
+| OD1 | When to run O0 (qemu deadline / Wi-Fi coexistence / artifact classification)? | before more RE / in parallel / after | **In parallel, at the next listening session.** It's cheap and needs the user on the buds. Still the only way to know whether the 96k noise is timing or codec. |
+| OD4 | Implementation language and numeric model | C fixed-point / C float / Rust | **C, `FIXED_POINT`**. Now more strongly supported: the rebuild *is* libopus v1.1 + patches (F31). |
+| OD7 | Samsung tables (D28): how does the code get them? | build-time extraction script → generated header (gitignored) / runtime load from the blob | **Both, by stage.** The harness reads them at runtime from the dlopened blob (batch 2). The native rebuild uses a build-time `tools/extract_tables.py <blob>` → `tables.h`. |
+| OD8 | Process-global state (F28.3, F31: `in_shared` iy/y, yy_lookup, `pre`, DRC, headroom, `previous_uhq_index`) | replicate globals / move into the handle | **Move into the handle**, bit-exact for the single-instance fresh-process case PipeWire uses. Before deciding, confirm which globals *carry state across frames* (DRC/headroom/previous_uhq_index) vs scratch (iy/y/yy_lookup). |
+| OD9 | Decoder acceptance without a reference decoder | no-desync + SNR / + listening | **Both** (unchanged). |
+| OD10 | Test-corpus music, especially the 96k tracks with the artifact | user's call | **User to name tracks.** Needed for O2 T2.2 golden frames and O3. |
+| OD12 | Patch 0004 is code-read only (no input changes the output) | keep / drop / keep + hunt for a discriminating input | **Keep**, flagged in F31. Revisit if a whole-frame mismatch ever points at remove_doubling. |
+| OD13 | Batch 2 (mode-dependent functions): how to build a libopus `CELTMode` for the reference | from the blob's static mode at runtime (decodes the F28.2 layout) / hand-transcribed tables | **From the blob at runtime.** It also verifies the F28.2 layout, and nothing Samsung-derived gets committed. |
+| OD14 | NEON asm functions (`ssc_comb_filter_*_asm`, `ssc_amp2Log2_asm`, `ssc_bitexact_cos_asm`) | test vs stock C first / transcribe semantics first | **Test vs stock C first** (bitexact_cos_asm already matched); transcribe only on mismatch. |
+| OD15 | When to start the decoder (O3) | after batch 2 / now in parallel | **After batch 2.** The decoder needs the same mode tables and allocation code, and 0002 already tells us the entropy-layer change. |
+| OD16 | Shape of the rebuild's libopus delta | patch series (quilt-style) applied at build / fork branch in the submodule | **Patch series** (as now). Each Samsung delta stays reviewable and is tied to the test that proves it. |
 
 ## Next-session checklist
-1. Settle OD1–OD11 and log them as D33+.
-2. Commit the docs (OD11).
-3. If OD1 = O0: run T0.1–T0.3 with the exact track/volume from F28.9.
-4. Install Ghidra (OD5), import the S24U blob, and apply the exported symbol names.
-5. T1.2: clone libopus, build pre-1.3 tags fixed-point for aarch64, and compare
-   `ec_enc_*`, `quant_coarse_energy` and `compute_allocation` to pin the version.
+1. Batch 2 of difftest (OD13): construct `CELTMode` from `ssc_custom_mode_create(96000|48000)`
+   output; test compute_allocation, normalise_bands, compute_band_energies,
+   spreading_decision, amp2Log2 (+asm), quant_coarse/fine/finalise energy, comb_filter (+asm),
+   ssc_fft / mdct_forward, quant_all_bands family (incl. compute_qn check, F32.2).
+2. Resolve F28.2's unknown mode fields (+0x30/+0x38/+0x58) while building the CELTMode.
+3. Then the Samsung-only live code: DRC/limiter, normal/uhq headroom (T4.7, the main noise
+   suspect), compute_band_energies_for_lastband, tone_detect.
+4. OD1 / OD10 need the user: listening session and track list.
