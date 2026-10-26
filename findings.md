@@ -783,3 +783,68 @@ bit-exact output.
   second channel's offset is read from mode `+0x1c` = shortMdctSize. That confirms that
   F28.2 row.
 - `_ssc_autocorr` (0x11044) is specialised to n=944 with a constant trip count.
+
+## F30 Function classification vs libopus v1.1 (T1.3, first pass)
+
+Method: Ghidra 12.2 headless decompile of the S24U blob (`~/src/ssc-codec`,
+`tools/ghidra-decomp.sh`); libopus v1.1 CELT built fixed-point for aarch64 with clang
+(`re/ref/celt_v1.1.o`); `tools/fnmatch.py` pairs functions by name and compares size,
+callees and immediate constants. Unexported statics (`FUN_*`) were identified by their
+callers and callees. Borderline cases were read by hand (decompile next to source).
+
+**Call graph.** The blob has **no indirect calls** (zero `blr`, no relocations to function
+symbols). The only entry points libbluetooth_jni uses are create/destroy/encode (F9).
+Everything not reachable from `ssc_encode`/`ssc_encoder_create` is dead code.
+
+**Samsung's recurring change is specialisation, not rewriting.** Stock functions are
+recompiled with fixed parameters: **C=2** (channel loops unrolled), **start=0**,
+**LM=3** (`M=8`), **lfe=0**, and decoder paths removed. Example: `ssc_quant_fine_energy`
+(0x113c9c) is libopus `quant_fine_energy` line for line, with `start` and `C` dropped from
+the signature. Specialised functions produce the same output as stock code called with
+those parameters, so the rebuild uses libopus source directly.
+
+Legend: **S** stock (identical) · **F** stock logic, specialised (fixed params) ·
+**M** modified logic · **N** Samsung-only · **D** dead (no callers) · **?** pending
+differential test (O2). Confidence: ✔ verified by reading · ~ inferred from
+size/callees/constants.
+
+| Blob function | libopus v1.1 | Class | Evidence |
+|---|---|---|---|
+| ssc_ec_enc_init, _encode, _encode_bin, _enc_bit_logp, _enc_icdf, _enc_bits, _enc_uint, _enc_shrink, _enc_done, _tell_frac, ec_laplace_encode | entenc.c / laplace.c | S ~ | sizes within 8 B; constants Jaccard 0.67–1.0; `SSC_COPY8`/`SSC_CLEAR` replace `OPUS_MOVE`/`OPUS_CLEAR` |
+| FUN_0010f88c | ec_enc_carry_out / ec_enc_normalize (static) | S ~ | only caller ec_enc_uint; 264 vs 272 B |
+| ssc_haar1, ssc_rcp, ssc_sqrt, ssc_rsqrt_norm, ssc_cos_norm, ssc_frac_div32, ssc_hysteresis_decision | bands.c / mathops.c | S ~ | sizes ±8 B, constants 0.64–1.0 |
+| ssc_encode_pulses | encode_pulses | S ~ | 212 vs 200 B, same callees |
+| ssc_quant_fine_energy | quant_fine_energy | F ✔ | start=0, C=2 |
+| ssc_quant_energy_finalise | quant_energy_finalise | F ~ | 556 vs 524 B, constants 0.71 |
+| ssc_compute_band_energies | compute_band_energies | F ✔ | 1.1 formula (F29), M=8, C=2 |
+| _ssc_autocorr | _celt_autocorr | F ✔ | n=944, lag 4, overlap 0 (F29) |
+| ssc_quant_coarse_energy + FUN_00113734 (=quant_coarse_energy_impl) | quant_coarse_energy | F ✔ | lfe branch gone = lfe 0; rest as 1.1 (F29) |
+| ssc_patch_transient_decision | patch_transient_decision | **M** ✔ | start hard-coded 13, mean over ch 0 only (F29) |
+| ssc_pitch_search + FUN_001126bc (=find_best_pitch) | pitch_search | **M** ✔ | calls Samsung `tone_detect` |
+| ssc_encoder_init | opus_custom_encoder_init | **M** ✔ | calls SSC_DRC_Init / SSC_DRC_SetPar; no ctl |
+| ssc_custom_mode_create | opus_custom_mode_create | **M** ✔ | 2 static modes only, Samsung tables (F27, F28) |
+| ssc_encode | celt_encode_with_ec | **M** ✔ | inlines transient/tf/dynalloc/prefilter/vbr analysis; adds DRC, headroom, 22nd band; equiv_rate fixed 510 (F29); does not call preemphasis |
+| ssc_alg_quant + FUN_001167d0 (=exp_rotation) | alg_quant | ? | 3640 vs 1536 B; calls cos_norm/rcp directly |
+| ssc_quant_all_bands + FUN_00109038 (=quant_band) + FUN_00109460 (=quant_partition, compute_theta inlined) + FUN_00109ca4 (=intensity_stereo) | bands.c | ? | callees as expected; stereo/theta paths need diff test |
+| ssc_stereo_itheta, ssc_normalise_bands, ssc_spreading_decision | bands.c | ? (likely F) | same callees, sizes fit C=2 unrolling |
+| ssc_compute_allocation | compute_allocation | ? (likely F) | decoder branches gone (enc-only); 2696 vs 3516 B |
+| ssc_pitch_downsample, ssc_remove_doubling, _ssc_lpc, ssc_pitch_xcorr_c1/_c2 | pitch.c / celt_lpc.c | ? | same callees; xcorr split into two Samsung variants |
+| ssc_comb_filter + `ssc_comb_filter_{const,function1..4}_asm` | comb_filter | ? | NEON re-implementation; bit-exactness vs C to test |
+| ssc_fft, ssc_mdct_forward | opus_fft / clt_mdct_forward | ? (likely F) | N=1728 only (radix 4/3, 432=4·4·3·3·3), twiddles from Samsung mode |
+| ssc_amp2Log2 + ssc_amp2Log2_asm | amp2Log2 | ? | NEON path plus C path |
+| SSC_COPY8/16/32, SSC_CLEAR | OPUS_COPY / OPUS_CLEAR | N (trivial) | memcpy/memset wrappers |
+| SSC_DRC_Init, SSC_DRC_SetPar, SSC_DRC_Exe, CalculateLimitGain, set_DRC_limit_gain, powercalc, Biquad_Narrow_int2int_stereo | — | **N**, live | called from ssc_encode / init: **in-encoder limiter/DRC** |
+| normal_headroom, uhq_headroom | — | **N**, live | called from ssc_encode |
+| ssc_compute_band_energies_for_lastband | — | **N**, live | 22nd band (F28.1) |
+| tone_detect | — | **N**, live | called from pitch_search |
+| ssc_preemphasis, headroom_process, get_header_from_bitrate, get_uhq_info_from_bitrate, set_limit_gain_from_bitrate, set_data_header, set_data_frame_header, last_band_info_calc, CalculateBandEnergy, CalculateBandEnergyLastBand, getPitchIndexGain, getPitchFilterThreshold, prefilter_gain_calculation, print_enc_fields, smull32_x86_scalable, ssc_ec_enc_patch_initial_bits | — | **D** | no callers. Header/bitrate logic must be inlined in ssc_encode; these copies are references only |
+
+**Size of the real RE work** (live, non-stock code):
+- Samsung-only: DRC/limiter ≈ 1.6 KB, headroom ≈ 2.7 KB, last-band energies ≈ 1.5 KB,
+  tone_detect ≈ 0.4 KB.
+- Modified: `ssc_encode` (16.6 KB; most of it inlined stock analysis), `pitch_search`,
+  `patch_transient_decision`, `encoder_init`.
+- About 15 "?" functions to confirm against stock with the O2 differential harness.
+
+**Correction to F28.5:** `print_enc_fields` is dead code (no callers), so it can't be
+used as a live probe without patching a call in.

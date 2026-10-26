@@ -38,7 +38,7 @@ the same. The rebuild pays off in three ways:
 - [x] T1.1 Identify lineage: fixed-point CELT from libopus with an `ssc_` prefix (F27).
 - [x] T1.2 Pin the libopus version: **v1.1** (range 1.1-rc … 1.1 final; these can't be
       told apart in this binary). See F29. Clone at `~/src/opus`.
-- [ ] T1.3 Classify every exported function as **stock**, **modified** or
+- [~] T1.3 (first pass done, F30; "?" rows await O2 diff tests) Classify every exported function as **stock**, **modified** or
       **Samsung-only**, with evidence. Expected Samsung-only: DRC (`SSC_DRC_*`,
       `CalculateLimitGain`, `Biquad_Narrow_int2int_stereo`, `powercalc`), headroom
       (`normal_headroom`, `uhq_headroom`, `headroom_process`, `headroom_gain`), framing
@@ -129,10 +129,10 @@ Each has a recommendation. Settle it, then record it as a D-entry in decisions.m
 | # | Question | Options | Recommendation |
 |---|---|---|---|
 | OD1 | Which first: O0 (timing/radio checks) or O1/O2 (version pin + harness)? | O0 first / O1–O2 first / both in parallel | **O0 first.** It takes about an hour and may reframe priorities. If clicks or dropouts show up, O5 (native) is the fix, not O6. |
-| OD2 | Where does the rebuild code live? | Inside `ssc-uhq/` / new private repo `~/src/ssc-codec` / fork of openssc | **New private repo** `~/src/ssc-codec`. The codec has its own build, tests and libopus base. `ssc-uhq` stays the investigation log (plans, decisions, findings). |
+| OD2 *(done: `~/src/ssc-codec`)* | Where does the rebuild code live? | Inside `ssc-uhq/` / new private repo `~/src/ssc-codec` / fork of openssc | **New private repo** `~/src/ssc-codec`. The codec has its own build, tests and libopus base. `ssc-uhq` stays the investigation log (plans, decisions, findings). |
 | OD3 | How to bring in libopus? | git submodule pinned to the T1.2 version / vendored copy / fetch at build | **Submodule pinned to `v1.1`** (T1.2 done, F29; BSD-3). Samsung deltas go in separate files so they're easy to diff against upstream. |
 | OD4 | Implementation language and numeric model | C fixed-point (match blob) / C float / Rust | **C, `FIXED_POINT`**. Bit-exactness (D30) requires the same integer arithmetic. Float can be an O6 experiment later. |
-| OD5 | Decompiler | Install Ghidra (headless + GUI) / keep objdump + tools / rizin | **Install Ghidra.** objdump was fine for Phases 1–3, but a 16 KB `ssc_encode` with inlined CELT needs decompiled pseudo-C to diff against libopus source. |
+| OD5 | Decompiler | Install Ghidra (headless + GUI) / keep objdump + tools / rizin | **Done:** Ghidra 12.2 at `~/.local/opt/ghidra`. **Install Ghidra.** objdump was fine for Phases 1–3, but a 16 KB `ssc_encode` with inlined CELT needs decompiled pseudo-C to diff against libopus source. |
 | OD6 | Use the Vinchethescript `encoder.c`? | Ignore / navigation aid only / start from it | **Navigation aid only** (F28.6). It was built from a different binary, is unverified, and its author calls it broken. Our own Ghidra output on the S24U blob is the reference. |
 | OD7 | Table extraction (D28) | Python script → generated C header at build time / runtime load from the blob | **Build-time script** (`tools/extract_tables.py <blob> > tables.h`, gitignored output). Same pattern as the encoder: the user supplies the blob. |
 | OD8 | Global-state semantics (F28.3) | Replicate process globals exactly / move into the handle and accept non-bit-exactness with multiple instances | **Move state into the handle**, but bit-exact for the single-instance, fresh-process case, which is the only case PipeWire uses. Note the deviation. |
