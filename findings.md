@@ -587,3 +587,199 @@ table (F12) crash the S24U blob.
    It works because the encoder is a pure codec with no rate intelligence — it compresses
    whatever 96k PCM it receives. The quality of the final audio depends entirely on the
    upstream resampler, which is external to the encoder on both Samsung and Linux.
+
+## F27 The SSC encoder is a fork of fixed-point CELT (libopus) (Phase 4)
+
+**Evidence (S24U blob, sha256 90c4c1cb…4ce7, identical to S26U):**
+
+1. **Exported names** are libopus CELT internals with an `ssc_` prefix: `ec_enc_init`,
+   `ec_encode`, `ec_enc_bits`, `ec_enc_uint`, `ec_enc_done`, `ec_enc_patch_initial_bits`,
+   `ec_enc_shrink`, `ec_laplace_encode`, `ec_tell_frac`, `compute_allocation`, `alg_quant`,
+   `encode_pulses`, `quant_all_bands`, `quant_coarse_energy`, `quant_fine_energy`,
+   `quant_energy_finalise`, `compute_band_energies`, `normalise_bands`,
+   `spreading_decision`, `hysteresis_decision`, `patch_transient_decision`, `haar1`,
+   `stereo_itheta`, `pitch_downsample`, `pitch_search`, `remove_doubling`,
+   `pitch_xcorr`, `comb_filter`, `mdct_forward`, `fft`, `_lpc`, `_autocorr`,
+   `tf_select_table`, `eMeans`, `custom_mode_create`. **Fixed-point build**: `frac_div32`,
+   `rcp`, `rsqrt_norm`, `bitexact_cos` exist only in libopus `FIXED_POINT`.
+2. **`ssc_encoder_get_size`** (0x9f0c) computes
+   `ch × (overlap×4 + nbEBands×6 + 4096) + 0xdc`. This is libopus
+   `opus_custom_encoder_get_size` (`in_mem` + `COMBFILTER_MAXPERIOD`=1024 prefilter
+   samples + **three** `opus_val16` per-band arrays: oldBandE/oldLogE/oldLogE2).
+   libopus **1.2** added a fourth (`energyError`), so the base predates 1.2.
+   *(Corrected 2026-10-26: originally written as "1.3". F29 pins the base to 1.1.)*
+3. **`ssc_encoder_create`** (0xa0b8) = `opus_custom_encoder_create`: mode lookup
+   (frame 864), malloc(get_size), `ssc_encoder_init`, error code -7 = `OPUS_ALLOC_FAIL`.
+4. **`ssc_custom_mode_create`** (0x11ac8) returns static modes (like libopus
+   `static_modes_fixed.h`): 0x1b9c0 for 44100/48000 and 0x1ba40 for 96000. Any other
+   rate returns NULL with err=-1, which explains the F26 segfaults at 88.2k/176.4k/192k
+   (the caller doesn't check NULL).
+
+**Mode parameters** (both modes share overlap and frame structure):
+
+| Field | 44.1/48k mode | 96k mode | Stock CELT 48k |
+|---|---|---|---|
+| frame size | 864 | 864 | 960 |
+| short MDCTs × size | 8 × 108 | 8 × 108 | 8 × 120 |
+| overlap | 108 | 108 | 120 |
+| nbEBands / effEBands | 22 / 21 | 22 / 21 | 21 / 21 |
+| MDCT n | 1728 | 1728 | 1920 |
+| alloc vectors | 11 × 22 (shared table @0x3f5e, 242 B) | 11 × 22 (same) | 11 × 21 |
+| PulseCache size | 346 | 334 | — |
+
+Band edges (eBands in 108-bin units, edges in Hz):
+- **48k** (@0x3f30): 0,1,2,3,4,5,6,7,8,10,12,14,16,20,24,28,34,40,48,60,72,84,**102** →
+  top edge 22.7 kHz. The 22nd band (18.7–22.7 kHz) is beyond `effEBands`, coded by the
+  Samsung `*_lastband*` functions.
+- **96k** (@0x5988): 0…12,14,16,20,24,30,36,54,72,90,**108** → bands 19–21 are
+  16–24 kHz, 24–32 kHz, 32–40 kHz and the last band is 40–48 kHz. At 96 kHz the
+  864-sample frame lasts 9 ms, so frequency resolution is 55.6 Hz/bin, half the 48k
+  mode's 27.8 Hz/bin. Three of 22 bands carry only ultrasonic content.
+
+**Samsung-only code** (no libopus equivalent): DRC/limiter (`SSC_DRC_Init/SetPar/Exe`,
+`CalculateLimitGain`, `set_DRC_limit_gain`, `Biquad_Narrow_int2int_stereo`, `powercalc`,
+`Soundbooster_DRC_Fs`), headroom (`normal_headroom`, `uhq_headroom`, `headroom_process`,
+`headroom_gain`, `margin`), framing (`get_header_from_bitrate`,
+`get_uhq_info_from_bitrate`, `set_limit_gain_from_bitrate`, `set_data_header`,
+`set_data_frame_header`, `previous_uhq_index`), 22nd band
+(`CalculateBandEnergyLastBand`, `ssc_compute_band_energies_for_lastband`,
+`last_band_info_calc`), `tone_detect`, prefilter helpers (`getPitchIndexGain`,
+`getPitchFilterThreshold`, `prefilter_gain_calculation`). **The encoder contains a
+bitrate-dependent limiter and headroom stage before CELT analysis.** It is a prime suspect
+for level-dependent noise or pumping, to be measured with the O3 decoder.
+
+**Consequence:** the rebuild is libopus CELT plus a bounded set of deltas, not a
+from-scratch codec. A matching CELT **decoder** is also feasible, which removes the
+"no SSC decoder exists" limitation that bounded Phases 1–3.
+
+## F28 Phase 4 groundwork notes (session 2026-10-26, not yet acted on)
+
+Loose findings gathered while scoping Phase 4. Each is either evidence for a later task or a
+trap to avoid.
+
+1. **Allocation table is custom, 11 × 22.** At 0x3f5e, 242 bytes, one column per band
+   including the 22nd. Values differ from libopus `band_allocation`. For example, row 1
+   is `118,110,103,93,86,…` where stock is `90,80,75,69,63,…`. The last column is 0
+   except in row 10 (=1), so the 22nd band gets almost no static allocation and is coded
+   by the `*_lastband*` path. (Reading it with stride 21 gives a misleading diagonal
+   pattern, so use 22.)
+
+2. **`CELTMode` layout differs from libopus** (tentative, from the relocations at
+   0x1b9c0 / 0x1ba40):
+
+   | Off | 48k mode | 96k mode | Tentative meaning |
+   |---|---|---|---|
+   | +0x00 | 44100, 108 | 96000, 108 | Fs, overlap |
+   | +0x08 | 22, 21 | 22, 21 | nbEBands, effEBands |
+   | +0x10 | →0x3f30 | →0x5988 | eBands (no `preemph[4]` before it, unlike libopus) |
+   | +0x18 | 8, 108 | 8, 108 | nbShortMdcts, shortMdctSize (`maxLM` field absent or elsewhere) |
+   | +0x20 | 11 | 11 | nbAllocVectors |
+   | +0x28 | →0x3f5e | →0x3f5e | allocVectors (shared) |
+   | +0x30 | →0x4050 | →0x59b6 | per-mode (logN?) |
+   | +0x38 | →0x4142 | →0x5aa8 | per-mode (?) |
+   | +0x40 | 1728, 3 | 1728, 3 | mdct.n, mdct.maxshift |
+   | +0x48, +0x50 | →0x1bac0, →0x1bad8 | same | kfft (shared) |
+   | +0x58 | →0x4170 | →0x4170 | shared (window or trig? overlap and n match across modes) |
+   | +0x60 | 346 | 334 | cache.size |
+   | +0x68..+0x78 | 3 ptrs | 3 ptrs | cache.index / bits / caps |
+
+   Which of +0x30/+0x38/+0x58 is logN, window or trig is unresolved. Settle it in T1.4 by
+   reading the code that dereferences each field.
+
+3. **Codec state partly lives in process globals, not the encoder handle.** `.bss`/`.data`
+   exports: `drc_struct`, `DRC_ChNum`, `DRC_ModeFlag`, `Soundbooster_DRC_Fs`,
+   `previous_uhq_index`, `in_shared`, `_pre_shared`, `_pcmpower`, `count_for_debug`,
+   `headroom_gain`, `margin`, `win_square`. Consequences:
+   - Two encoder handles in one process share DRC/headroom/prefilter state, including
+     Samsung's dual-play handle (0xdbf328, F14).
+   - State can survive `ssc_encoder_destroy` → `create`. The D13 "warm-up init is a no-op"
+     test ran in one process, so it may not have covered this.
+   - Golden vectors must come from a **fresh process per run**, and the native port must
+     reproduce the global-state semantics to stay bit-exact.
+
+4. **`smull32_x86_scalable`** (0xfff8) is just `(int64)a*b >> 32`, but its name implies
+   Samsung keeps an **x86 build** of this code. So the `*_asm` NEON functions
+   (`ssc_comb_filter_*_asm`, `ssc_amp2Log2_asm`, `ssc_bitexact_cos_asm`) likely have
+   portable C equivalents with identical results. The native port can be plain C.
+
+5. **`print_enc_fields`** (0x15664) is a debug dumper that calls `printf` (9 `printf` call
+   sites in the blob). It may print internal encoder fields and could serve as a free
+   state probe for the O2 harness.
+
+6. **There is a third encoder build.** `~/src/ssc-research/samsung-ssc-reversed` (Vinchethescript, GitHub)
+   ships a blob with sha256 `9248e264…b461`. That differs from both S24U (`90c4c1cb…`) and
+   A31 (`b923b408…`). Its `encoder.c` is 5647 lines of raw Hex-Rays output. The author calls
+   it non-functional and NEON-broken. At most it is a navigation aid, and it was built from
+   a different binary.
+
+7. **Reusable assets already on disk:**
+   - `~/src/ssc-capture/uhq584_getlucky.frames`: S24U blob output, UHQ-584 at 96k, format
+     `u32 len | bytes` per frame (first frame 660 B, `ff e0 0d e3`), ~6.6k frames
+     (~60 s). This is the first decoder test input for T3.3. The source PCM can be
+     regenerated with `frame_stats.py`.
+   - `~/src/ssc-capture/frame_stats.py` / `probe_encoder.py`: the blob-helper pipe
+     protocol is argv `so rate ch bits bitrate`, stdin `u32 n | int32[2n]` PCM, stdout
+     `i32 len | bytes`. That's enough for T2.2 golden frames without new tooling.
+   - `~/src/ssc-capture/golden/*.golden`: SSCOnWindows frames. **Not** valid UHQ references
+     (F4); use only for 48k basic mode.
+   - `~/src/ssc-capture/btsnoop_hci.log`: real phone→buds capture (A31, basic mode). It is
+     a decoder test input for F-mode frames only.
+
+8. **Six qemu core dumps** of `ssc_blob_helper` in `~/src/ssc-capture/` (2026-10-21, three
+   at 03:48 and three at 17:01). These are probably the F26 Test 3 runs (88.2k/176.4k/192k).
+   That fits F27: `ssc_custom_mode_create` returns NULL for those rates and
+   `ssc_encoder_create` dereferences it unchecked (`ldp w10,w8,[x0,#4]` at 0xa0e8). This is
+   not verified from the cores. They can be deleted once confirmed (~62 MB).
+
+9. **User report 2026-10-26 contradicts F21.** F21 rated UHQ-584 with a native 96k source
+   and 96k graph "excellent, no noise". The user now hears noise and artifacts on that
+   same path with the S26U-extracted encoder (byte-identical to S24U). We don't know yet
+   what changed: content, volume, radio environment, or plugin/PipeWire version.
+   Phase 4 O0 should note the exact track, volume and conditions.
+
+10. **Tooling gap.** No decompiler is installed (no Ghidra, radare2 or rizin). Phase 1–3
+    analysis was objdump plus `tools/fn.py`/`xref.py`. `ssc_encode` alone is ~16 KB of
+    code (largest function), with CELT's `celt_encode_with_ec` likely inlined.
+
+## F29 libopus base pinned: v1.1 (T1.2)
+
+Method: walk the libopus tags (clone at `~/src/opus`). For each boundary between releases,
+find a source change that survives into machine code, then check the blob for it. Many
+boundaries are unreadable because Samsung rewrote exactly the lines that changed (see
+"Samsung changes" below). The decisive checks are those in functions Samsung left
+alone.
+
+| Boundary | Source change | Blob evidence | Verdict |
+|---|---|---|---|
+| ≥ 1.1 | `patch_transient_decision`, exported `celt_preemphasis` appear in the 1.1 cycle | both exported | ≥ 1.1 cycle |
+| < 1.2 | `get_size` gains a 4th per-band array (`energyError`) in 1.2 | `ssc_encoder_get_size` (0x9f0c) has `nbEBands×6` = 3 arrays | < 1.2 |
+| < 1.1.1 | fixed-point `compute_band_energies`: 1.1 uses `shift = ilog2(maxval)-10`; 1.1.1 uses `ilog2-14+((logN>>3)+LM+1)>>1` with split SHL/SHR loops | 0x7820: `clz` then `sub #21` (= -(ilog2-10)), no logN load, `bandE = 1 + VSHR32(sqrt(sum), -shift)` with the `maxval ≤ 0x3ff` branch (0x7868) | **≤ 1.1** |
+| ≥ 1.1-rc | `_celt_autocorr`: beta has `ac0 = 1+n` and always copies to `xx`; rc has `ac0 = 1+(n<<7)` and the `overlap==0` path reads `x` directly | 0x11070 loads ac0 init `120833` (rodata 0x27e0) = `1 + (944<<7)`; no windowed copy. n=944 = (COMBFILTER_MAXPERIOD 1024 + 864)/2, the CELT pitch-analysis length | **≥ 1.1-rc** |
+| rc / rc2 / rc3 / 1.1 | rc→rc2: asserts only. rc2→rc3: `celt_preemphasis` temp types, `hysteresis_decision((opus_val16)(equiv_rate/1000))` | both sites rewritten by Samsung (below) | indistinguishable |
+
+**Conclusion: base = libopus 1.1 (Dec 2013).** Use tag `v1.1`. It is codegen-equivalent
+to 1.1-rc…rc3 for every function Samsung kept. Toolchain per the ELF note: Android NDK
+r25c (clang 14.0.7). That only matters for instruction-level comparison, not for
+bit-exact output.
+
+**Samsung changes noticed along the way** (feed into T1.3):
+- `ssc_preemphasis` (0xade4) is **rewritten**. It has no pre-emphasis filter (consistent
+  with the mode struct having no `preemph[]`, F28.2). It only de-interleaves stereo
+  **int32** input (8-byte stride) and shifts left by **12**, or by **4** when argument 5 ≠ 0.
+  Both land at 2^27 full scale (16-bit input << 12, or 24-bit input << 4). Our plugin
+  feeds 2^29 full scale (shift 6 from S24_32), so something upstream in `ssc_encode`
+  (the headroom stage?) must remove ≥ 2 bits first. **Headroom scaling is load-bearing
+  and must be traced in T4.7.**
+- `patch_transient_decision` (0xa170) uses the 1.1.2-style `start`-based loops, but with
+  **start hard-coded to 13** and the mean taken over channel 0 only (divisor `end-14`).
+  So transient patching only considers bands ≥ 13.
+- `quant_coarse_energy` (0x13340): the `lfe` branch is removed. `max_decay =
+  MIN(16<<10, nbAvailableBytes<<7)` and `loss_distortion` cap 200 are as in 1.1.
+- `ssc_encode` intensity decision (0xe974): `hysteresis_decision(510, thresholds@0x3d18,
+  hysteresis@0x3d46, 22 - x, …)`. The `equiv_rate/1000` argument is **hard-coded to
+  510 kbps** regardless of the real bitrate.
+- `ssc_compute_band_energies` (0x776c): `M` is folded to 8 (`eBands<<3`), so every frame
+  is analysed as LM=3 (8 × 108 short blocks). The per-channel loops are unrolled, and the
+  second channel's offset is read from mode `+0x1c` = shortMdctSize. That confirms that
+  F28.2 row.
+- `_ssc_autocorr` (0x11044) is specialised to n=944 with a constant trip count.

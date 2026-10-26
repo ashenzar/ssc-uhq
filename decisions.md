@@ -147,3 +147,38 @@ proprietary. See F26.
 *Why:* Closes the question of whether the encoder has internal rate intelligence.
 Confirms our pipeline is architecturally correct — not that it's better or worse than
 Samsung's.
+
+**D27 — Phase 4: rebuild the SSC codec natively, on a libopus CELT base.** The blob is
+fixed-point CELT with an `ssc_` prefix (F27). We start from libopus source and
+reverse-engineer only Samsung's changes, instead of decompiling all 64 KB of `.text`.
+*Why:* the best config still has audible noise and artifacts at 96k (user, 2026-10-26).
+Every external factor has been tuned, so the remaining unknown is inside the encoder,
+which we cannot observe or change while it is a qemu-hosted blob.
+
+**D28 — Phase 4 implementation follows the decompiled logic; the repo stays private and
+carries no Samsung data.** This supersedes D5's "no Samsung code copied" for Phase 4.
+Constant tables (band edges, alloc vectors, eMeans, windows, twiddles, header tables) are
+extracted at build time from the user's own blob by a script, never committed. The
+existing README rule still applies: the user supplies their own encoder.
+*Why:* personal interoperability work (D8). Keeping tables out of git preserves the
+"no Samsung material distributed" property and ties the build to a blob the user owns.
+
+**D29 — Decoder before encoder.** *Why:* there has never been a way to measure SSC output
+objectively. Every quality judgement so far has been a listening test. A decoder tells us
+whether the 96k noise is born in the encoder, validates the bitstream understanding
+independently of bit-exactness, and is the yardstick for all O6 tuning.
+
+**D30 — Bit-exact first, improve second.** The native encoder must reproduce the blob's
+bytes on the whole corpus before any behaviour change. *Why:* the blob is the only
+correctness oracle. Mixing "rebuild bugs" with "intended improvements" would make both
+impossible to debug, and a non-bit-exact encoder risks frames the buds decode wrongly.
+
+**D31 — Differential testing per exported function, under qemu.** *Why:* the blob exports
+nearly every internal function by name (F27), so each one can be called in isolation with
+chosen inputs and its output compared with our C version. That turns the rebuild into many
+small verifiable steps.
+
+**D32 — Rule out timing and transport before investing in the rebuild (Phase 4 O0).**
+*Why:* qemu-hosted encoding at 9 ms frames and AX201 Wi-Fi/BT coexistence can both cause
+clicks or dropouts that sound like "artifacts". Both are cheap to measure. If either is the
+cause, native execution (O5) or a radio fix matters more than encoder internals.
