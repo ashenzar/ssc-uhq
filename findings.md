@@ -848,3 +848,52 @@ size/callees/constants.
 
 **Correction to F28.5:** `print_enc_fields` is dead code (no callers), so it can't be
 used as a live probe without patching a call in.
+
+## F31 Differential testing results, batch 1 (O2 / T1.3 "?" rows)
+
+Harness: `~/src/ssc-codec/harness` (`make run`; `make STOCK=1 run` for pure v1.1). One
+aarch64 binary under qemu dlopens the blob and links libopus v1.1 celt/ with the patch
+series `harness/patches/`. Each test feeds identical pseudo-random inputs to both sides,
+**restricted to the domain the encoder actually uses**, and compares every output bit for bit.
+
+**Samsung deltas found (each one a patch on libopus v1.1):**
+
+| Patch | Change | Evidence | Fixes (fail on stock → pass) |
+|---|---|---|---|
+| 0001 | `MULT32_32_Q31` is an **exact 64-bit** product `(int64)a*b>>31`, not v1.1's 16-bit partial-product approximation | `frac_div32` variant test: exact Q31 20000/20000, stock 14100/20000. Stock MULT16_32_Q15 is already exact | frac_div32, _celt_lpc, stereo_itheta (via celt_atan2p), remove_doubling |
+| 0002 | **24-bit range coder**: `EC_CODE_BITS 24` (not 32) | `ssc_ec_encode` (0xf850) normalises while `rng ≤ 0x8000`, carries out `val>>15`, masks `val` to 23 bits; init rng=2^23, nbits_total=25. ec_ctx layout identical to libopus | ec (all ops incl. laplace, done, overflow), encode_pulses |
+| 0003 | **PVQ search precision**: `Rxy² >> 7` kept as 32-bit (stock: `MULT16_16_Q15` → int16), score compare in 64-bit | `ssc_alg_quant` 0x16244–0x16254: `mul w1,w1,w1; lsr #7; mul x…; cmp x4,x3` | alg_quant (20000 cases incl. exp_rotation + encode_pulses) |
+| 0004 | `remove_doubling`: pitch gains clamped to Q15ONE; g1's `yy` sum and `xx*yy` in 64-bit | 0x12c28/0x12eb0 `cmp #0x8000 → mov #0x7fff`; 0x12da4 64-bit `add x9,x8,x9` / `mul` | **code-read only**: no test input found where it changes the output (decisions are robust to it) |
+
+**Consequence for the decoder (O3):** the 24-bit range coder is a bitstream-level change.
+A libopus CELT decoder rebuilt with `EC_CODE_BITS 24` uses the matching `ec_dec`
+constants. Combined with Samsung's mode tables, that is the expected route to an SSC
+decoder.
+
+**Confirmed bit-exact (stock logic + patches):** celt_rcp, celt_sqrt, celt_rsqrt_norm
+(exhaustive), celt_cos_norm (exhaustive), bitexact_cos (exhaustive 1…16383), frac_div32,
+the whole ec_enc API + ec_laplace_encode, haar1, hysteresis_decision, encode_pulses,
+alg_quant (+ inlined exp_rotation), stereo_itheta, celt_pitch_xcorr (both variants),
+_celt_lpc, _celt_autocorr, pitch_downsample, remove_doubling.
+
+**Samsung signature specialisations** (needed to call or rebuild them):
+- `stereo_itheta(X, Y, N)`: `stereo` fixed to **1**.
+- `_ssc_lpc(lpc, ac)`: order 4. `_ssc_autocorr(x, ac)`: n=944, lag 4, no window.
+- `ssc_pitch_xcorr_c1(x, x, ac)` = `celt_pitch_xcorr(x, x, ac, 940, 5)` for autocorr. It
+  returns 0, not maxcorr, which is unused by its caller.
+- `ssc_pitch_xcorr_c2(x, y, xcorr, len, max_pitch)`: general, but len must be a multiple
+  of 8 and max_pitch a multiple of 4 (no tail code); the only call is (216, 244).
+- `ssc_pitch_downsample(pre0, pre1, x_lp, len)`: pre1 must equal pre0+len (maxabs
+  scans 2·len from pre0), C=2, len=1888.
+- `ssc_bitexact_cos_asm(x, 16384-x, &imid, &iside)`: two lanes, 32-bit results. It differs
+  from stock only for itheta < 64 or > 16320 (cos rounds to 32768, stock wraps to −32768).
+  Whether compute_theta can reach those values is still to be checked.
+- Call sites in `ssc_encode`: `pitch_search(pitch_buf+512, pitch_buf, N, 979, &T)` and
+  `remove_doubling(pitch_buf, 1024, 15, N, &T, prefilter_period, prefilter_gain)`:
+  stock run_prefilter arguments.
+
+**More global state (extends F28.3):** alg_quant's `iy[]`/`y[]` are global arrays (144
+entries each, in `in_shared` at 0x24dac / 0x24fec). The blob **crashes for band size
+N > 144**, which SSC never produces (widest band 18 << 3). remove_doubling's
+`yy_lookup` is also global. The prefilter buffer `pre` is reached through the GOT, so
+it is global as well.

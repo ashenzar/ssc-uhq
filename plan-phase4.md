@@ -49,7 +49,7 @@ the same. The rebuild pays off in three ways:
       window, MDCT twiddles, PulseCache) and confirm the struct layout against libopus.
 
 **O2. Differential test harness (D31)**
-- [ ] T2.1 `harness/blobcall`: an aarch64 program run under qemu. It dlopens the blob and
+- [x] T2.1 *(done as `~/src/ssc-codec/harness/difftest`, F31)* `harness/blobcall`: an aarch64 program run under qemu. It dlopens the blob and
       calls any exported function by name with inputs from a file, then dumps its
       outputs and the global state it touches.
 - [ ] T2.2 Test corpus: sines (100 Hz, 1 kHz, 15 kHz, 30 kHz), log sweeps, white and pink
@@ -73,7 +73,7 @@ the same. The rebuild pays off in three ways:
 **O4. Bit-exact native encoder (D30)**
 
 Bottom-up. Each step passes its per-function vectors before the next starts:
-- [ ] T4.1 Range coder (`ec_enc_*`, `ec_laplace_encode`) and fixed-point math (`frac_div32`,
+- [x] T4.1 *(bit-exact via libopus + patches 0001/0002, F31)* Range coder (`ec_enc_*`, `ec_laplace_encode`) and fixed-point math (`frac_div32`,
       `rcp`, `rsqrt_norm`, `sqrt`, `bitexact_cos`, `amp2Log2`, `smull32`).
 - [ ] T4.2 FFT/MDCT (`ssc_fft`, `mdct_forward`) with Samsung's 1728-point twiddles.
 - [ ] T4.3 Band energy, normalisation and the 22nd band.

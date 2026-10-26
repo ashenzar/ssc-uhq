@@ -242,5 +242,5 @@ S948BXXS3AZF4 (official Samsung FUS download).
 - `plan-phase3.md` — Phase 3 AVDTP timing (closed — moot per D21/F20)
 - `plan-phase4.md` — Phase 4 native codec rebuild on a libopus CELT base (in progress)
 - `decisions.md` — decision log (D1–D32)
-- `findings.md` — evidence-backed results with addresses and parameters (F1–F30)
+- `findings.md` — evidence-backed results with addresses and parameters (F1–F31)
 - `tools/` — analysis scripts
