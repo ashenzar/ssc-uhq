@@ -734,10 +734,10 @@ index 01c5f3a..5049d15 100644
    include_directories : [ configinc ],
 diff --git a/spa/plugins/bluez5/sscenc/encoder.c b/spa/plugins/bluez5/sscenc/encoder.c
 new file mode 100644
-index 0000000..12e0431
+index 0000000..3d5c548
 --- /dev/null
 +++ b/spa/plugins/bluez5/sscenc/encoder.c
-@@ -0,0 +1,544 @@
+@@ -0,0 +1,555 @@
 +#include "ssc/encoder.h"
 +
 +#include <stdlib.h>
@@ -763,10 +763,11 @@ index 0000000..12e0431
 +    int blob_in;
 +    int blob_out;
 +    pid_t blob_pid;
-+    /* Samsung's encoder expects 24-bit audio at 2^29 full scale (as SSCOnWindows feeds it);
-+     * PipeWire delivers S24_32 at 2^23, so samples are shifted up by 6 bits here. */
++    /* Samsung's encoder takes UHQ (96 kHz) and 256k/328k audio as 24-bit at 2^23, the other
++     * basic bitrates (44.1/48 kHz) as 16-bit at 2^15. Hotter input makes its DRC limiter ride the
++     * gain (ssc-uhq F38.7, F40, F43); 256k/328k fed 16-bit decode 48 dB low (F47.4). */
 +    int32_t scaled[SSCENC_BLOB_MAX_FRAME_SAMPLES * SSCENC_MAX_CHANNELS];
-+    unsigned input_shift; /* SSCENC_INPUT_SHIFT, default 6 (2^29) */
++    int input_shift; /* SSCENC_INPUT_SHIFT (0-8, default 0) above the mode's level: 6 dB steps */
 +#endif
 +};
 +
@@ -1014,7 +1015,9 @@ index 0000000..12e0431
 +    enc->blob_pid = -1;
 +    {
 +        const char *sh = getenv("SSCENC_INPUT_SHIFT");
-+        enc->input_shift = (sh && *sh >= '0' && *sh <= '8' && sh[1] == '\0') ? (unsigned)(*sh - '0') : 6u;
++        enc->input_shift = (sh && *sh >= '0' && *sh <= '8' && sh[1] == '\0') ? *sh - '0' : 0;
++        if (enc->cfg.sample_rate != 96000 && enc->cfg.bitrate != 256000 && enc->cfg.bitrate != 328000)
++            enc->input_shift -= 8;
 +    }
 +    if (start_blob(enc) < 0) {
 +        free(enc);
@@ -1196,9 +1199,17 @@ index 0000000..12e0431
 +        return SSCENC_EINVAL;
 +
 +    frame_count = (uint32_t)frame_samples;
-+    for (size_t i = 0; i < frame_samples * (size_t)enc->cfg.channels; ++i)
-+        enc->scaled[i] = clamp_i32((int64_t)(((int32_t)((uint32_t)pcm[i] << 8)) >> 8) * ((int64_t)1 << enc->input_shift),
-+                                   INT32_MIN, INT32_MAX);
++    for (size_t i = 0; i < frame_samples * (size_t)enc->cfg.channels; ++i) {
++        int64_t v = ((int32_t)((uint32_t)pcm[i] << 8)) >> 8;
++        if (enc->input_shift >= 0)
++            enc->scaled[i] = clamp_i32(v * ((int64_t)1 << enc->input_shift), INT32_MIN, INT32_MAX);
++        else {
++            /* Round to the narrower scale, e.g. 24 to 16 bits. */
++            int64_t top = (int64_t)1 << (23 + enc->input_shift);
++            int64_t half = (int64_t)1 << (-enc->input_shift - 1);
++            enc->scaled[i] = clamp_i32((v + half) >> -enc->input_shift, (int32_t)-top, (int32_t)(top - 1));
++        }
++    }
 +    pcm_bytes = frame_samples * (size_t)enc->cfg.channels * sizeof(*pcm);
 +    if (write_full(enc->blob_in, &frame_count, sizeof(frame_count)) < 0 ||
 +        write_full(enc->blob_in, enc->scaled, pcm_bytes) < 0)

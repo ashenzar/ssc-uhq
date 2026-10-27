@@ -1,0 +1,34 @@
+#!/bin/sh
+# Runs the SSC encoder helper for the openssc PipeWire plugin (installed as
+# ~/.local/libexec/sscenc/sscenc-blob-run, the path compiled into the plugin). The plugin
+# passes "rate channels bits bitrate" and talks to the helper over stdin/stdout.
+#
+# SSCENC_BACKEND=native (Phase 4 O5, T5.1): the native rebuild of Samsung's encoder
+# (~/src/ssc-codec/native, bit-exact with the blob, ssc-uhq F46/F47), run directly.
+# SSCENC_BACKEND=tee (T5.2): the native helper also runs the blob below on every frame,
+# sends the blob's frames on, and logs any frame where the two differ (stderr, journal).
+# Anything else (the default): Samsung's ARM64 encoder from the user's own phone under qemu,
+# started as its own transient user unit: WirePlumber's MemoryDenyWriteExecute (inherited
+# by children) blocks qemu's code translation, and this keeps WirePlumber itself fully
+# hardened.
+case "${SSCENC_BACKEND:-blob}" in
+native|tee)
+  helper="${SSCENC_NATIVE_HELPER:-$HOME/.local/libexec/sscenc/x86_64/ssc_native_helper}"
+  if [ ! -x "$helper" ]; then
+    echo "SSCENC_BACKEND=$SSCENC_BACKEND but $helper is missing" >&2
+    exit 127
+  fi
+  if [ "$SSCENC_BACKEND" = tee ]; then
+    SSCENC_TEE_CMD="SSCENC_BACKEND=blob $0" exec "$helper" "$@"
+  fi
+  exec "$helper" "$@"
+  ;;
+esac
+if [ -z "${SSCENC_BLOB_SO:-}" ]; then
+  echo "SSCENC_BLOB_SO is not set" >&2
+  exit 127
+fi
+exec /usr/bin/systemd-run --user --pipe --quiet --collect \
+  --property=NoNewPrivileges=yes --property=ProtectHome=read-only --property=PrivateTmp=yes \
+  -- /usr/bin/qemu-aarch64 -L /usr/aarch64-linux-gnu -E LD_LIBRARY_PATH=/home/asael/.local/libexec/sscenc/shims \
+  /home/asael/.local/libexec/sscenc/aarch64/ssc_blob_helper "${SSCENC_BLOB_SO}" "$@"

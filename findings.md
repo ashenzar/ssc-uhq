@@ -471,6 +471,29 @@ explanations for the marketing figure:
 No evidence of hidden higher-bitrate e-modes in the S24U blob. All bitrate table entries
 at 0xf06e0 are accounted for: 584k, 584k, 291k, 152k (4 entries, indexed by sample_mode 0–3).
 
+**Addendum (2026-10-26, Phase 4).** `ssc_encode`'s header table (F35) knows more E-mode
+rates than the sample_mode table above: 250k, 308k, 442k and **886k** (tag `e4`). The
+highest is 886k. No path that sets sample_mode reaches it, and it has never shown up in a
+capture. Nothing in the encoder comes near 2,304k. At 96 kHz, 2,304 kbps would be 2,592
+bytes per 864-sample frame, against ~657 at 584k.
+
+Classic BR/EDR can't carry it either. This is inferred from the Bluetooth spec, not
+measured: the fastest packet, 3-DH5, holds 1,021 bytes in 5 slots plus 1 return slot
+(3.75 ms). That is ≈ 2.18 Mbps one way in theory, before L2CAP/AVDTP overhead and
+retransmissions, so A2DP in practice gets ~1.0–1.5 Mbps. 2,304,000 also equals 24 bit ×
+96 kHz × 1 channel. Either way it is a PCM-rate figure, not an operating bitrate.
+
+Verdict: for this encoder over classic A2DP, the 2,304k figure is a marketing ceiling;
+the real live maximum is 584k. Still not ruled out: a separate "SSC HiFi" path in a newer
+blob or over LE Audio (explanations 1–3 above). Neither has been examined.
+
+Explanation 2 is ruled out: the S26U encoder is byte-identical to the S24U one (D2). In the
+S26U stack, "HiFi" is only sink capability bit 0x04, which selects `bits_per_sample=32` for
+the same encoder (F13). Our Buds3 Pro set the higher-priority bit 3, so they run bits=34.
+What bits=32 changes inside the encoder is untested. The encoder does differ by device: the
+A31 blob (README, sha256 `b923b408…`) has basic modes only and no UHQ. So "S24U and S26U
+share the encoder" holds; "nothing differs from flagship to non-flagship" does not.
+
 ## F24 UHQ tier quality comparison for 44.1k content (listening test)
 
 Tested all three UHQ tiers with graph locked at 48 kHz (double resample path F22):
@@ -786,6 +809,8 @@ bit-exact output.
 
 ## F30 Function classification vs libopus v1.1 (T1.3, first pass)
 
+*Historical: every "?" row is settled and the full table, every export by name, is F48.*
+
 Method: Ghidra 12.2 headless decompile of the S24U blob (`~/src/ssc-codec`,
 `tools/ghidra-decomp.sh`); libopus v1.1 CELT built fixed-point for aarch64 with clang
 (`re/ref/celt_v1.1.o`); `tools/fnmatch.py` pairs functions by name and compares size,
@@ -1079,3 +1104,518 @@ last-band energies 1.5 KB, headroom 2.7 KB, pitch_search + find_best_pitch 1.9 K
 0.9 KB, DRC/limiter ~1.6 KB, patch_transient_decision 0.5 KB, tone_detect 0.4 KB,
 encoder_init/create 0.6 KB. Weighted by the Phase 4 objectives (O0 0%, O1 ~90%, O2 ~40%,
 O3 0%, O4 ~45%, O5/O6 0%), the phase is about **25–30%** done.
+
+## F34 MDCT/FFT, last-band energies, header cutoff (batch 3)
+
+Uncommitted on top of e76b53b: patch **0009** (`ssc_mdct.c`), the Makefile compiles files a patch creates, and three new difftests. **35/35 tests pass** bit-exact at 2000 iterations (~5 s under qemu).
+
+**1. MDCT/FFT (T4.2, OD21).** New file, not a delta on `mdct.c` (OD21). Q31 window, trig and twiddles are formula-generated (OD17). Bit-exact against `ssc_fft` (432 and 54 points) and `ssc_mdct_forward` (shift 0 stride 1, shift 3 stride 8) on both modes, including our FFT run on the blob's own kfft state. Three fixes after the first transcription, all visible in the first failing run:
+
+- `bitrev[]` is already an int32 index (`2 * complex index`). Indexing with `2 * bitrev[k]` scrambles the FFT.
+- Q31 cannot hold −1. `sin`/`cos` of ±1 is stored as −2147483647, same clamp as libopus. The only twiddle that hit it was index 108 imag (`−π/2`).
+- The second kfft field is the shift, 0 or 3, not a boolean. The 54-point state has 3. The FFT still branches on "zero vs not".
+
+The blob's second radix-3 stage runs one block past the buffer (49×9 for 432, 7×9 for 54). That block starts at the first sample after `nfft` and is not reproduced. Outputs inside `[0, nfft)` match without it.
+
+**2. Last-band energies (T4.3).** `ssc_compute_band_energies_for_lastband(mode, X, bandE, count, uhq, idx)` is stock `compute_band_energies` on `count` equal slices of one band. No patch. `uhq == 0` slices the top band (live call: count 4). `uhq != 0` slices the band `idx` below the top, idx 0 being the top (live call: count 8, idx 0..3). Sample bounds are `8 * eBands[band + i/count …]`, so a 144-sample top band becomes four slices of 36 or eight of 18. Channel 1 is stored right after channel 0 (`bandE[i + c*count]`), not at stride `nbEBands`. Bit-exact on the live calls for both modes.
+
+**3. Adaptive end and header bytes 2–3 (T3.1).** In `ssc_encode` at 0xcf34–0xd114. Energies land at `sp+0x190`. A slice is "hot" when channel0 + channel1 exceed the threshold.
+
+- Non-UHQ, count 4, threshold 30001. Tests slices 3, 2, 1 (not slice 0) and adds 12, 8, 4 or 0 to header byte 2. `idx` stays 0, so `end` does not change.
+- UHQ, count 8, threshold 12001, `idx` from 0 upward. Tests slices 7..0. The first hot slice sets a code of 8 (top slice) down to 1. If all four bands are cold, code = 0 and `idx` = 3. Header byte 2 += `idx * 4`. Header byte 3 keeps its low 5 bits; its top 3 bits become `code - 1` when code > 0, else 0. `end = st->end - idx`.
+
+Bytes 0–1 are written as the halfword `0xeeff`. E-mode bitrates then overwrite byte 1 with `e0` (F35); F-mode leaves `ff ee`. Byte 3’s initial tag and the E/F split are in F35, not in this paragraph.
+
+**4. OD18, alloc-table selector.** At the top of `ssc_encode` (0xb71c). Frame struct `+0x180` is 1 iff the bitrate argument is > 192000 (`0x2ee00`), else 0. 0 selects the shared alloc table (mode `+0x28`); anything else selects the per-mode table (`+0x30`). UHQ-584, UHQ-291 and basic-229 are above that line; UHQ-152 is below it.
+
+**Progress estimate (end of batch 3).** 38.0 KB of 62.4 KB (**~61%**) of live encoder code is verified bit-exact. Still open: `ssc_encode` 16.6 KB, headroom 2.7 KB, pitch_search + find_best_pitch 1.9 KB, DRC/limiter ~1.6 KB, patch_transient_decision 0.5 KB, tone_detect 0.4 KB, encoder_init/create 0.6 KB. Weighted by objective (O0 0%, O1 ~90%, O2 ~45%, O3 ~15% — header known, no decoder yet — O4 ~60%, O5/O6 0%), the phase is about **35%** done.
+
+## F35 Header bitrate tags and the E/F split (read from ssc_encode, not yet in a decoder)
+
+The prologue at 0xb6cc–0xbc38 matches the captured headers in F4. `ssc_encode` writes `ff ee` first. A later store to byte 1 runs only for the E-mode bitrate set and forces that byte to `e0`.
+
+**Byte 3, before the adaptive rewrite of its top 3 bits** (exact bitrate match):
+
+| Bitrate | Byte 3 | Bytes 0–1 |
+|---|---|---|
+| 88 000 | `f0` | `ff ee` |
+| 96 000 | `f1` | `ff ee` |
+| 128 000 | `f2` | `ff ee` |
+| 192 000 | `f3` | `ff ee` |
+| 229 000 | `f4` | `ff ee` |
+| 328 000 | `f5` | `ff ee` |
+| 256 000 | `f6` | `ff ee` |
+| 291 000 | `e0` | `ff e0` |
+| 308 000 | `e1` | `ff e0` |
+| 442 000 | `e2` | `ff e0` |
+| 584 000 | `e3` | `ff e0` |
+| 886 000 | `e4` | `ff e0` |
+| 250 000 | `e5` | `ff e0` |
+| 152 000 | `e6` | `ff e0` |
+
+48k/229k captures are `ff ee .. f4` and 96k/584k captures are `ff e0 .. e3` (F4). The `bits == 24` test in this prologue does not change the tag.
+
+The E-mode set is also the set that runs the 8-slice scan (F34.3). F-mode runs the 4-slice scan. That flag is not "sample rate is 96 kHz" and it is not "bitrate > 192000" (OD18). 152k is E-mode and below 192k; 229k, 256k and 328k are F-mode and above 192k.
+
+**UHQ-152 skips the scan.** Its tag is `e6`. `ssc_encode` compares byte 3 with `e6` and, on a match, does not call `ssc_compute_band_energies_for_lastband` and does not touch bytes 2–3 again. It forces the amount subtracted from `st->end` to 4. `st->end` was stored as `nbEBands` (22) at encoder+0x14, so this path encodes 18 bands. The adaptive path subtracts `idx` (0..3) from the same base.
+
+**Byte 3 after the 8-slice scan.** The top 3 bits become `code - 1` (code 8..1), or 0 when code is 0. The low 5 bits stay the tag. For 584k the tag is `e3`, so the eight results are `e3 c3 a3 83 63 43 23 03`. Code 0 and code 1 both leave `03`. That is the set F5 observed on 96k/584k (e3, 03, c3, 23, a3, 43, 63, 83). `idx` is added to byte 2 as `idx * 4`, which is what separates code 0 from code 1.
+
+**Byte 2’s base is still unread.** Before the add, the prologue stores a byte built from the halfword at encoder+140 and the low 2 bits of encoder+142. 48k/229k captures keep byte 2 at `0d` for every frame (F4, F5), so on that material the base and the 4-slice choice do not vary. Reproducing the base is T4.8 work. The decoder only has to read the byte.
+
+**Last-band edges are not “whatever mode is loaded”.** With the F-mode argument the blob uses one fixed end table, the 48k top band split into four (672, 708, 744, 780, 816). The start still comes from the mode’s `eBands[21]`. A 96k mode plus an F-mode bitrate would start at 720 and end on that 48k table. The difftest does not cover that pair. Live calls are 48k with F-mode and 96k with E-mode (eight slices of a 96k band). OD22.
+
+## F36 Frame header parser and the first decoder (T3.1, start of T3.2)
+
+Uncommitted, on top of the batch-3 tree: `harness/ssc_header.h`, patch **0010**, and difftest entries `header` and `decode`. `make -C harness run` is 37/37 green. `header` checks the parser, the size formula, and all 6666 frames of `~/src/ssc-capture/uhq584_getlucky.frames`. `decode` checks live `ssc_encode` lengths and that the patched decoder returns 864 samples. It does not claim range-coder sync.
+
+**1. F35's "byte 1 forced to e0" is only the first store.** E-mode then writes `0xe0 | (frame_counter >> 4)`, so byte 1 is `e0`..`ef`. When the high nibble is `e`, byte 1 is `ee` and collides with F-mode; the bitrate tag decides. Byte 2 bits 0–1 stay 1 (the halfword at encoder+0x8e, initialised by the `0x10000` store). Bits 2–3 are `idx` in E-mode, or the F-mode 4-slice addend. Bits 4–7 are the frame counter's low nibble. The counter is the short at encoder+0x8c; it increments in the `ssc_encode` epilogue and wraps at 0xff. On the 6666-frame capture: every frame is 660 bytes, tag low 5 bits always `03`, byte 1 is `e0`..`ef`, byte 2 bits 0–1 are always 1.
+
+**2. Frame size, confirmed against live encodes.** `bytes = bitrate * 864 / (Fs * 8)`. F-mode adds `(bytes * 3) >> 7`. Then force odd, and the return value is that plus 3 (4-byte header, payload is one less than the odd count). `Fs` is the mode rate: init stores the create rate at encoder+96, then overwrites it with 44100 when the create rate is exactly 48000. 96000 and 44100 stay. Checked: 584k/96k → 660, 152k/96k → 174, 229k created at 48000 → 576.
+
+**3. What the decoder already matches.** The range coder starts at byte 4. There is no pitch tapset bit (patch 0008 / 0010). The transient bit on the wire is the inverse of the flag `ssc_encode` stores at sp+236: internal transient encodes 0, non-transient encodes 1, both with logp 3. TF logp is chosen from the internal flag (`4 then 5` when transient, `2 then 4` otherwise), so a stock `tf_decode` that trusts the wire bit uses the same logps. `ssc_tf_select_table` is only the LM=3 row (8 bytes at 0x2838). The encoder indexes it with `wire_bit * 4`, which is stock `tf_select_table[3][4*isTransient + …]`. Whether the frame writes TF at all is not the sp+224 guess below; F37 measured it. F-mode does, E-mode does not.
+
+**4. Where sync still failed, before F37.** With tapset omitted and stock `tf_decode` on every frame, noise frames get through silence, pitch (absent on this noise), transient, coarse energy, TF, spread, dynalloc, trim and fine energy with `ec_get_error` still 0. The PVQ `ec_dec_uint` errors (N=3, K=128 and N=9, K=26) were a shifted read, not a bad codebook. Resolved in F37. The inverse MDCT is not in the tree: `compute_inv_mdcts` returns immediately when `mode->window` is NULL, so the PCM is not meaningful yet.
+
+**Progress estimate.** Encoder bytes verified bit-exact are unchanged at 38.0 KB of 62.4 KB (**~61%**). By objective: O0 0%, O1 ~90%, O2 ~45%, O3 ~55% (range sync on the three live modes, no PCM yet; F37), O4 ~60%, O5/O6 0%. The phase is about **45%** done.
+
+## F37 E-mode has no TF bits; range sync on the three live modes (T3.2)
+
+The pulse-decoder mismatch was not a PVQ bug. `alg_quant` roundtrips at N=3, K=128, and `quant_all_bands` roundtrips a full 584k-shaped frame when the decoder is given the whole range buffer (front bytes and the raw bits at the end). The illegal `ec_dec_uint` values (`t=65750` against `V(3,128)=65538`, and `t=257` against `qn+1=257`) were later symbols read at the wrong place.
+
+**1. What the live encoder writes, from the symbol trace.** Coarse energy's tell matches the decoder on every checked frame. The next symbols do not. On 96 kHz E-mode (584k and 152k, transient or not) the symbol after coarse is the spread icdf (`ftb=5`). There is no TF. On 48 kHz F-mode (229k) TF is stock `tf_decode`: a transient frame uses logp 2 then 4, a steady frame uses logp 4 then 5, then the tf_select bit, then spread. F36.3's "UHQ frames do write TF" came from reading sp+224 the wrong way around. They don't.
+
+**2. The other setup bug that had to be fixed first.** The blob's `CELTMode+0x78` is the expanded int32 `init_caps(LM=3,C=2)` result. Stock `init_caps` indexes `cache.caps` as a byte table. Pointing the decoder at the int32 array reads off the end and invents caps, so the allocation (and then PVQ) diverges even when the signalling is right. `build_mode` keeps the blob's `cache.index` and `cache.bits` (48 kHz band 20, F33.2) and uses stock's byte caps. `compute_allocation` tests still pass the int32 caps in directly; only the decoder calls `init_caps`.
+
+**3. What sync means now.** `decode` selects `CELT_SET_SSC_MODE` from the header: 2 for E-mode (no TF), 1 for F-mode (stock TF, still no tapset bit). On 24 frames each of 584k, 152k and 229k, `ec_get_error` stays 0 and the tell finishes within 1 bit of `8*(len-4)`. A one-bit gap is the range coder's ceiling, not spare payload. Inverse MDCT is still absent (`window == NULL`).
+
+**Pitfall.** Initialising a decoder with `ec_range_bytes()` drops the raw end-bits. A single `ec_enc_uint` of 256 with `ft=257` then decodes as 257 and sets the range error. The packet length is the encoder's storage, and that is what the decoder must see.
+
+## F38 Decoder PCM (T3.2 done, T3.3): synthesis, band 21, padding, and the input-scale gain riding
+
+Uncommitted in `~/src/ssc-codec` on top of F37: patch **0010** extended, harness `build_mode` and the `decode` test rewritten. `make -C harness run` is 37/37 green. Music runs are report-only (`DT_MUSIC`, see the codec README).
+
+**1. Synthesis.** The harness gives the decoder mode stock's Q15 window and a v1.1 `clt_mdct_init(1728, 3)` lookup, both formula-generated (OD17). Samsung's Q31 forward MDCT (patch 0009) keeps stock's 4/N scaling and no pre-emphasis (F29: `ssc_preemphasis` has no filter, `preemph[]` is all zero, so stock `deemphasis` is a pass-through). A stock inverse is enough: on every input the output is the input delayed by exactly **108 samples** (the overlap). I/O gain on synthetic input (±8000, `bits` 34 or 24 give the same result): 96 kHz `out = in / 256` (input `<<4` to 2^27, output `>>12`); 48 kHz `out = in` (input `<<12`, the 16-bit path).
+
+**2. Band 21 was never denormalised.** `celt_decode_with_ec` clamps `effEnd` to `effEBands` (21), so the 22nd band was decoded from the stream (patch 0007 makes the encoder code it) and then dropped. 0010 now skips the clamp when `ssc_mode != 0`. Tones then come back in band 21 at 26 dB (584k).
+
+**3. F-mode band 21 is folded by design (inferred).** At 48 kHz, band 21 decodes with the right energy (out/in 0.85–0.88) and no correlation, for noise and for a pure tone. Both 48 kHz alloc tables (`+0x28`, `+0x30`) hold 0 for band 21 in every vector except the top one, which holds 1. The 96 kHz per-mode table gives band 21 real bits (2, 10 in the top vectors). Range sync means the decoder runs the encoder's allocation, so the band is almost certainly spread/folded with no pulses. Pulse counts were not read directly. The test leaves this band out and prints it.
+
+**4. Bits the decoder leaves unread are zero padding.** On tones every band reaches its cap. The 584k frames then end with `tell` ≈ 4253 of 5248 bits, and the payload holds a 124-byte zero run between the range-coded front (ends at payload offset 345) and the raw end bits. That is the CELT encoder's `ec_enc_done` padding, not a desync. The sync rule is now: no range error, and a gap > 1 bit must be covered by a zero run of at least `gap/8 - 1` bytes. Noise still lands within 1 bit.
+
+**5. Reconstruction quality (`decode` test, 24 frames each).** Tones, one per band centre: every coded band comes back at gain 0.9–1.1 and 19–43 dB SNR (584k: 23–43 dB, bands 0–21; 152k: 25–41 dB, bands 0–17, silent above `end` 18; 229k: 19–35 dB, bands 0–20). White noise is coarse in the high bands (584k: 31 dB in bands 0–17, 4–8 dB in 18–21), as CELT allocates.
+
+**6. Real capture.** All 6666 frames of `uhq584_getlucky.frames` decode in sync. 914 of them are padded, and `end` is 19 (3121 frames), 20 (3513), 21 (8) or 22 (24). The 16-bit output has rms 14084 (−7.3 dBFS) and 0.6 % of samples at full scale. Source PCM for that capture is unknown; the user says its Get Lucky source is a 44.1 kHz master.
+
+**7. At the plugin's 2^29 input scale, the encoder rides the gain frame by frame, and nothing signals it.** Measured by encoding and decoding 20 s of a native 96 kHz/24-bit FLAC (Nirvana, *MTV Unplugged in New York*, SIDE-1 from 120 s, −20 dBFS rms) and of Get Lucky (−11.6 dBFS), 584k and 152k, fitting gain per frame at lag 108:
+
+| Input full scale | Overall gain / SNR (584k) | Frame SNR p10 / p50 | Gain step between frames p50 / p90 / max |
+|---|---|---|---|
+| 2^29 (plugin, `SSCENC_INPUT_SHIFT=6`) | Nirvana 3.85 / 9.2 dB; Get Lucky 1.56 / 6.4 dB | 16 / 23 dB; 14 / 22 dB | 0.9 / 2.4 / 10.2 dB; 1.2 / 3.7 / 14.5 dB |
+| 2^25 | | 24 / 35 dB; 16 / 25 dB | p90 1.0 / 3.0 dB |
+| 2^24 | | 33 / 36 dB; 22 / 34 dB | p90 0.1 / 1.5 dB |
+| **2^23 (plain 24-bit)** | **Nirvana 1.00 / 35.1 dB; Get Lucky 1.00 / 37.5 dB** | **33 / 36 dB; 35 / 41 dB** | **≤ 0.06 / 0.10 / 0.23 dB** |
+
+At 2^29, per-frame gain falls as rms^−0.75 (a ~4:1 compressor around a −8 dBFS output median), with jumps up to 14.5 dB between consecutive 9 ms frames. 584k and 152k ride identically, so the gain is applied before quantisation: it is the headroom/limiter stage (T4.7). That answers F29's open point: `ssc_encode` does not remove 2 bits from a 2^29 input. It rides the gain instead. The range-coded payload is fully consumed (§4) and header bytes 0–3 are fully mapped (F36), so the gain is not signalled; the buds play the compressed signal. At 2^23 the encoder is linear and the decoded loudness matches the source.
+
+The 2^29 choice traces to a comment in `config/ssc-pipewire-1.6.8.patch` ("as SSCOnWindows feeds it") and `plan.md` T2.3/discrepancy #3, which cites openssc's `encoder.c`. Nothing in these notes shows what the **phone** feeds. So this is either our bug, or Samsung's sound with a hot source. OD23.
+
+**8. Listening after the OD23 change (user report, 2026-10-26): not a valid test, corrected the same day.** The user added `SSCENC_INPUT_SHIFT=0`, selected uhq with `ssc-switch uhq`, and reported it "still sounds wrong". The first handoff took that to mean the artifact is probably not the codec. That was wrong. `ssc-switch` takes the shift as an optional second argument that defaults to 6 (`config/bin/ssc-switch:61`). It calls `~/src/ssc-capture/set_ssc.sh PROFILE 6`, which deletes every `Environment=SSCENC_INPUT_SHIFT=` line and appends `=6` (`set_ssc.sh:7,15–16`; `ssc-switch:71` deletes it too). The live conf afterwards held `SSCENC_INPUT_SHIFT=6` plus a commented `#…=6` line, and wireplumber was restarted at 12:51. **So the buds were still fed at 2^29, and OD23 is untested.** To test shift 0: `ssc-switch uhq 0`. Pitfall: any manual edit of the shift is overwritten by the next `ssc-switch`/`set_ssc.sh` run unless the shift is passed as an argument.
+
+**Not covered yet.** 48 kHz F-mode on music: synthetic input shows a `<<12` (16-bit) input path at 48 kHz, so 2^29 input there may be far hotter still. There is no PCM comparison for the capture, no spectrogram, and the basic-mode golden/btsnoop frames have not been through the decoder.
+
+**Progress estimate.** Encoder bytes verified bit-exact are unchanged: 38.0 KB of 62.4 KB (**~61%**). By objective: O0 0 %, O1 ~90 %, O2 ~45 %, O3 ~80 % (T3.1, T3.2 done; T3.3 synthetic + 96k music + capture sync; T3.4 partly answered by §7, no per-band map), O4 ~60 %, O5/O6 0 %. The phase is about **50 %** done.
+
+## F39 Listening A/B: the input shift is the artifact (OD23), and the runtime path is clean
+
+**1. Listening (user, 2026-10-26, buds, uhq-584).** Track: Daft Punk "Get Lucky", 88.2 kHz hi-res file played in mpv. At `SSCENC_INPUT_SHIFT=6` (2^29) it "sounded terrible". At `ssc-switch uhq 0` (2^23, confirmed live by `ssc-switch status`: "input shift: 0") it "sounds good without audible artifacts". This is the first valid shift-0 test; F38.8's earlier attempt ran at 6. It matches the measurement in F38.7: at 2^29 the encoder's headroom stage rides the gain frame by frame (unsignalled steps up to 14.5 dB on this track); at 2^23 it is linear. One track, one listener, no blind A/B. The native 96 kHz source (Nirvana) and 44.1/48k content were not re-heard at shift 0.
+
+**2. Runtime check during the shift-0 playback (`pw-top -b`, 30 × 1 s, `pw-dump`, user journal).**
+- Encoder: Samsung's blob, still under qemu (`systemd-run … qemu-aarch64 … ~/.local/libexec/sscenc/aarch64/ssc_blob_helper …/s24u/libScalable_Encoder.so 96000 2 34 584000`). No part of `~/src/ssc-codec` is in the live path.
+- Sink `bluez_output.E8_C9_13_75_5F_AD.1` (node 94): driver at rate 96000, quantum 2048 (21.3 ms), format S24_32LE, ERR 0 in all 30 samples, B/Q ≤ 0.09.
+- mpv stream (node 99): S32LE at 88200 (`node.rate = 1/88200`), ERR 0, B/Q ≤ 0.04.
+- User journal since the 12:51 wireplumber restart: no xrun/underrun/drop messages.
+- Limit: pw-top times only the PipeWire cycle. Encode time inside the qemu helper is not visible here, so T0.1 is still open.
+
+**3. Who resamples 88.2 → 96 kHz.** PipeWire's audioconvert (SPA's native resampler) inside mpv's stream adapter, at `resample.quality = 14`. mpv delivers 88.2 kHz natively. The graph cannot run at 88.2 kHz: `clock.allowed-rates = [ 48000 96000 ]` and the SSC sink only accepts 96000. The blob never resamples (D26). Samsung's own resampling on the phone happens in the Android audio stack, which is not in our blob. Since the same resampler path sounds bad at shift 6 and clean at shift 0, it is not this artifact's cause.
+
+**4. Open from this.** Basic mode (48 kHz, 229k) takes the `<<12` 16-bit input path (F38.1). There, even shift 0 (S24 at 2^23) would be 8 bits hotter than the encoder's nominal input, and the plugin's `SSCENC_INPUT_SHIFT` only shifts left (0–8). Unmeasured on music; needs a right shift (or a negative shift) to test.
+
+## F40 Basic mode (48 kHz, 229k) takes 16-bit input: at the plugin's 2^23 it rides the gain (F39.4)
+
+Measured with the `decode` test's music path, now selectable by rate (`DT_MUSIC_RATE=48000`, or `44100` to create the encoder at 44100 as the phone does, F9). Inputs: 20 s from 120 s of Nirvana *MTV Unplugged* SIDE-1 (96k/24, −20 dBFS rms) and the 88.2k/24 album "Get Lucky", each resampled to 48 kHz with soxr. That is what PipeWire does in basic mode, and no native 48k file is at hand. Basic-229 with bits=34, gain fitted per frame at lag 108. "Gain/io" is decoded loudness relative to the source (1.00 = same dBFS).
+
+| Input full scale | Nirvana: gain/io, SNR · frame SNR p10/p50 · gain step p90/max | Get Lucky: same |
+|---|---|---|
+| 2^29 (old plugin, shift 6) | 3.65, 9.9 dB · 17/24 dB · 2.1/8.8 dB | 1.36, 9.1 dB · 16/22 dB · 3.0/13.5 dB |
+| **2^23 (plugin now, shift 0)** | **3.60, 9.8 dB · 17/24 dB · 2.1/9.0 dB** | **1.34, 9.2 dB · 16/23 dB · 3.1/13.6 dB** |
+| 2^19 | 3.61, 9.7 dB · 17/24 · 2.1/9.4 | 1.34, 9.1 dB · 16/22 · 3.0/13.6 |
+| 2^17 | 3.30, 14.5 dB · 22/29 · 1.1/5.3 | 1.34, 9.4 dB · 16/23 · 2.9/9.8 |
+| 2^16 | 2.00, 29.2 dB · 27/30 · 0.15/0.32 | 1.29, 12.0 dB · 18/25 · 1.9/5.6 |
+| **2^15 (16-bit)** | **1.00, 28.8 dB · 27/29 · 0.16/0.31** | **0.99, 26.4 dB · 23/29 · 0.15/0.51** |
+| 2^14 | 0.50, 28.8 dB · 27/29 · 0.16/0.31 | 0.50, 26.4 dB · 23/29 · 0.15/0.43 |
+
+**1. The 48 kHz mode's nominal input is 16-bit.** Linear (gain 1.00, steps ≤ 0.5 dB) at 2^15 and below; from 2^16 (Get Lucky) or 2^17 (Nirvana) up, the headroom stage rides the gain exactly as UHQ does above 2^23 (F38.7). Between 2^29 and 2^19 the output loudness hardly moves (gain/io 3.6 and 1.34 regardless of input): the stage is a leveller, so a hotter input changes nothing but the riding. Creating at 44100 instead of 48000 gives identical numbers (Get Lucky at 2^23 and at 2^15), so the scale follows the mode, not the create rate. It matches F38.1's synthetic I/O: 96 kHz shifts input `<<4`, 48 kHz `<<12`, both to Q27 full scale.
+
+**2. So the plugin's basic modes were 8 bits hot even after D33**, and 14 bits hot before it (shift 6). Every basic-mode listening result so far was taken under heavy gain riding, including the README quality ranking (UHQ-584 > UHQ-291 > basic-229 > UHQ-152). That ranking is void until it is re-heard. The UHQ entries in it ran at 2^29 too.
+
+**3. Plugin change (D34, `config/ssc-pipewire-1.6.8.patch`).** `SSCENC_INPUT_SHIFT` now counts 6 dB steps above the mode's nominal level. When the encoder rate is not 96000, the plugin subtracts 8, rounds S24 to 16-bit (`(v + 128) >> 8`, clamped to int16), and feeds that. Scripts are unchanged (`ssc-switch high` still writes 0). The patch applies cleanly to a fresh 1.6.8 tree and `encoder.c` compiles with `-Wall -Wextra` (the only warning, unused `encode_fake_s16`, was already there). **The installed plugin is not rebuilt**, so live basic mode still runs at 2^23 (this fix) and its compiled UHQ default is still 6 (D33).
+
+**Not covered.** No listening at basic mode with the fix. Only 229k measured (192k/256k/328k use the same mode). 24→16 is rounded, not dithered; its noise (−101 dBFS) is far below the codec's ~29 dB SNR. The plugin's `sscenc_encode_s16` blob branch shifts 16-bit input `<<14` into the 24-bit sign-extension and would wrap; it is unreachable in the blob build (S24_32 is negotiated), left as is.
+
+## F41 Shift-0 UHQ listening across source rates; plugin rebuilt with D34
+
+**1. Listening (user, 2026-10-26, buds, uhq-584, shift 0).** Tracks at 44.1, 48, 88.2 and 96 kHz all "sounded good". In a blind test the user could not tell the source rates apart, which is what they expected. Together with F39.1 this closes the UHQ artifact: at 2^23 every source rate sounds clean. Not covered: uhq-291/152, and a Wi-Fi-off run (T0.2).
+
+**2. Plugin rebuilt and installed (D34 live).** Fresh PipeWire 1.6.8 clone at `~/src/openssc/pipewire-1.6.8` (excluded locally in openssc's `.git/info/exclude`), current `config/ssc-pipewire-1.6.8.patch` applied cleanly, `ninja … libspa-codec-bluez5-ssc.so` built with only the old `encode_fake_s16` warning. Installed to `~/.local/lib/spa-0.2-patched/bluez5/`. The previous file is kept as `libspa-codec-bluez5-ssc.so.pre-d34` (sha256 752c3c88…; new c2908cf8…). WirePlumber maps the new file. The compiled `SSCENC_INPUT_SHIFT` default is now 0, and basic mode feeds 16-bit. Only the SSC codec plugin was rebuilt. The clone has the SSC patch but not the three HFP patches from `~/src/pipewire-hfp-atbcc-fix/patches`. The loaded `libspa-bluez5.so` is still the 2026-10-20 build, which has the HFP fix and the SSC core hooks; `…hfp-only.bak` has no SSC strings. `ssc-switch high` then gave basic-229, S24 48 kHz sink, shift 0, graph `[ 48000 96000 ]`. Basic mode has not been listened to yet.
+
+**3. Basic-mode listening with D34 (user, 2026-10-26, buds, basic-229 via `ssc-switch high`, shift 0 = 16-bit input).** Tracks at 44.1, 48, 88.2 and 96 kHz: "no audible artifacts, clean sound". This is the first basic-mode listen at the encoder's nominal level. Every earlier one ran 8–14 bits hot (F40.2). With F41.1, both live modes now sound clean from every source rate. Not covered: a profile re-ranking at the right levels, basic bitrates other than 229k, and Wi-Fi off.
+
+**4. All profiles, and Wi-Fi off (user, 2026-10-26, buds, shift 0).** Every profile from uhq-584 down to basic-229 "sounds good", including uhq-291 and uhq-152. The user gave no ranking between them. Disabling Wi-Fi "didn't change anything at all", so AX201 Wi-Fi/BT coexistence plays no audible part (T0.2). The README's old quality ranking is replaced by this result.
+
+**Pitfall.** In zsh, the README's `meson setup build -Dsession-managers=[] …` fails with "no matches found". Quote it: `'-Dsession-managers=[]'`.
+
+## F42 qemu encode time is far inside the deadline (T0.1); O0 closed
+
+`tools/helper_timing.py` drives the live helper path (`~/.local/libexec/sscenc/sscenc-blob-run` → systemd-run → qemu-aarch64 → `ssc_blob_helper` + S24U blob). It speaks the plugin's protocol: read the ready word (int32 0), then per frame write u32 864 + int32 PCM and read int32 length + payload. It times each round trip, so pipe and systemd-run overhead are included. i7-10510U, 2026-10-26, while the buds were connected on the live helper (uhq-152).
+
+| Run | Frames | p50 | p90 | p99 | p99.9 | max | Budget | Over budget | Mean load |
+|---|---|---|---|---|---|---|---|---|---|
+| uhq-584, 96k, 2^23, Nirvana 300 s | 33 331 | 0.83 | 1.06 | 1.75 | 6.10 | 11.35 ms | 9.00 ms | 6 | 10 % |
+| uhq-584, 96k, 2^23, Get Lucky 240 s | 26 664 | 0.83 | 1.07 | 1.57 | 2.28 | 6.50 ms | 9.00 ms | 0 | 10 % |
+| basic-229, 48k, 2^15, Nirvana 300 s | 16 664 | 0.81 | 1.01 | 1.39 | 1.87 | 4.89 ms | 18.00 ms | 0 | 5 % |
+
+Startup (spawn to ready word) took 2–38 ms, and the first frame 26–33 ms (qemu translating cold code). That is a one-off, absorbed at stream start. The six overruns in the first run were isolated (no repeat on the second UHQ track). The sink cycle is 2048 samples (21.3 ms at 96k, F39.2), which carries ~2.4 frames, so one 11 ms frame does not miss a cycle. Encoding under qemu is ~10 % of one core at uhq-584, against AC5's 5 % target for the native backend.
+
+**Conclusion (AC1).** Timing and transport do not contribute to the artifact. Encode time has ~10× headroom (F42), the graph shows no xruns (F39.2), Wi-Fi coexistence changes nothing (F41.4), and every profile sounds clean once the input level is right (F41). The artifact was the input level alone (F38.7, F40). T0.4 (decoding over-the-air frames) is not needed.
+
+**Pitfall.** Forgetting the ready word shifts every reply by one frame and makes the encode look nearly free (p50 0.76 ms with a "0.0 ms" first frame and a 0-length reply in the set).
+
+## F43 Headroom is a fixed EQ (bit-exact); the level riding is the DRC limiter (T4.7)
+
+Harness tests `headroom` and `drc` in `~/src/ssc-codec/harness/difftest.c` (uncommitted). The full suite passes, 39 tests.
+
+**1. Correction: "headroom" never rode the gain.** F38.7, F40, D33 and D34 put the gain riding on "the headroom stage". It is the **DRC/limiter**. The `<<4`/`<<12` input scaling is `ssc_preemphasis`'s (F29), not headroom's. Order in `ssc_encode`: biquad + `powercalc` ×2 + `CalculateLimitGain` → `set_DRC_limit_gain` → `SSC_DRC_Exe` ×8 on raw input (0xbcd8–0xbe24); then MDCT; then `uhq_headroom`/`normal_headroom` on the MDCT bins (0xc9fc/0xca1c, 0xcdec/0xce18); then `ssc_compute_band_energies`.
+
+**2. Headroom = fixed per-bin gain on the spectrum, bit-exact.** Stateless, signal-independent, applied every frame at any level. Arguments: `(X, bitrate, M=8, eBands)` plus a channel stride (864) for `normal_headroom`. Each bin gets `MULT16_32_Q15(g, x)` with 32-bit wrap.
+- `uhq_headroom` (E-mode). From `s = eBands[18]·8`: bins `[s, s+25)` 0x78c8 (−0.50 dB). If bitrate ≥ 270000: `[s+25, 354)` 0x7864, `[354, 400)` 0x7800, `[400, 864)` 0x779c (−0.59 dB). Otherwise: `[s+25, 350)` 0x781e, `[350, 864)` 0x779c.
+- `normal_headroom` (F-mode). If bitrate ≥ 96000: bins from `eBands[20]·8 + 68` to `eBands[22]·8` take the `.data` table `headroom_gain` (240 int32, low 16 bits, index `bin − eBands[20]·8`). Nothing writes the table. Otherwise two tapers: from `s1 = eBands[17]·8` (320), `0x7fff − 3·(i−s1)`; from `s2 = eBands[20]·8 − 15` (561), `0x7767 − 3·(s2−s1) − 5·(i−s2)`. The second taper restarts 0x898 below where the first ends.
+
+  The test transcribes both and compares them against the blob on 4000 frames (all 14 bitrates, realistic and full-range int32 spectra), with no mismatch. The blob's actual per-bin gains corrected the second taper; the decompile alone gave it wrong. The native encoder needs `headroom_gain` extracted (OD7).
+
+**3. The level-dependent stage is `SSC_DRC_Exe`, a block peak limiter with global state.** It runs 8 calls per frame, each on 108 stereo samples of raw input. A block engages when more than 24 of its 216 values exceed the threshold `drc_struct`. The target gain is then `threshold / peak` (Q22), otherwise 1.0. Attack is instant (coefficient 0); release is 0x3ca4a1/2^22 = 0.9475 per block. The gain ramps linearly within a block. `SSC_DRC_Init` and `SSC_DRC_SetPar` set the globals at 0x120504–0x120514.
+- **Threshold, per frame:** `CalculateLimitGain(narrow-band power, total or residual power, bitrate, Fs)` returns Q15. At 96k it gives 0x75d4–0x7b4c (0.921–0.963). At 48k (Fs 44100) it gives 0x741d–0x7a94, or 0x8000, which never fires. E-mode always shifts it `<<8` (24-bit scale). F-mode shifts it only when `bits == 24`, so with `bits=34` the basic-mode threshold sits on the **16-bit scale**. That is why basic mode wants 2^15 (F40) and UHQ wants 2^23 (F38.7): above that, nearly every block exceeds the threshold and the limiter rides.
+- **Never back to unity.** The release maps the shortfall `d` below 2^22 to `ceil(0.94755·d)`, which stalls at d = 19. After the first engaged block the gain stays at (2^22 − 19)/2^22 (−0.00004 dB) for good. Every sample then becomes `(x·(2^22−19)) >> 22`, a change of up to ±19 LSB at 24-bit. Inaudible, but required for bit-exactness. Verified on the blob: 200 quiet blocks with up to 24 peaks before any engagement come out unchanged; after one loud block, 1000 of 1000 quiet blocks match that formula exactly.
+
+**4. How often it fires at the right input level** (whole tracks, raw blocks, loosest/strictest threshold; `tools/drc_count.py FILE 96000 24` or `FILE 48000 16`):
+
+| Track (peak) | UHQ 96k at 2^23 | Basic 48k at 2^15 |
+|---|---|---|
+| Get Lucky 88.2k master (0.00 dBFS) | 0.34–1.16 % of blocks, from 0.1 s | 0.45–1.49 %, from 0.1 s |
+| Nirvana SIDE-1 (−1.67 dBFS) | 0 | 0 |
+| Arctic Monkeys "Do I Wanna Know" (−0.03 dBFS) | 0.002–0.19 %, from 6.7 s | 0.014–0.17 % |
+
+So the limiter still fires on hot masters at the correct level. It reduces the gain by at most ~0.85 dB (threshold ≥ 0.907), which fits the ≤ 0.23 dB frame-gain steps measured at 2^23 (F38.7). It is inaudible (F41). On quiet masters it never fires, and the stage is an exact pass-through.
+
+**Answer to "is the headroom stage needed for byte-exactness?"** Yes, and it is now done. It is fixed EQ, not level-dependent. The DRC limiter is also needed: hot masters engage it at any input level, and after that its −19/2^22 tail changes every sample. Its 1.7 KB (`SSC_DRC_*`, `CalculateLimitGain`, `powercalc`, `Biquad_Narrow_int2int_stereo`) is the next T4.7 step. `drc` checks behaviour only, not a full transcription.
+
+**Progress.** Headroom adds 2.67 KB (`uhq_headroom` 1428 B + `normal_headroom` 1240 B). Verified bytes: 40.7 KB of 62.4 KB (**~65%**). By objective: O0 100 %, O1 ~90 %, O2 ~45 %, O3 ~80 %, O4 ~63 %, O5/O6 0 %.
+
+## F44 The DRC limiter chain is bit-exact (T4.7 done)
+
+Five harness tests in `~/src/ssc-codec/harness/difftest.c` replace F43's behaviour-only `drc` (uncommitted): `drc_powercalc`, `drc_biquad`, `drc_limitgain`, `drc_exe` and `drc_chain`. The full suite passes, 43 tests in ~20 s. Each transcription was taken from the disassembly, not the decompile, and each test fails when its reference is mutated (no error feedback, sign-extended carry, count ≥ 24, no lookahead min, unshifted F-mode threshold, the 270000 edge, and so on).
+
+**1. `Biquad_Narrow_int2int_stereo` (0x6d8c)** is a direct-form-I biquad per channel on `x << 7` (32-bit wrap), with 64-bit accumulation. The output word is `y = acc >> 32`, and the low word carries into the next sample as error feedback. Feedback taps hold `y << 3`, and the output is `(y + 8) >> 4`. Inside a call the carry is zero-extended. Between calls it is stored sign-extended, and the test catches that difference. State is int64[10] at handle +0x90: R x1 x2 y1 y2 acc, then L x1 x2 y1 y2 acc. The loop runs two stereo frames per iteration. Coefficients (5 int32, OD7): `coeffs96andbelow` at 0x3d00 is used in E-mode always and in F-mode when the bitrate is < 96001. `coeffs` at 0x3cec is used in F-mode at ≥ 96001. Both are low-passes. The output goes to the global `_pcmpower`.
+
+**2. `powercalc` (0x6ea0)** samples **one stereo frame in 32**: frames 0, 32, …, 832, so 27 of 864. Each sample adds `((x² >> 16) & ~1) << 4`, and the result is `(u64 sum) >> 9`. n must be a multiple of 32; otherwise the blob never leaves the loop. So the threshold choice rests on 27 sample pairs per frame, not on the frame's power.
+
+**3. `CalculateLimitGain` (0x6f0c)** matches the decompile. The 96k E-mode ladder compares the narrow-band power with total × {0.94, 0.92, 0.90, 0.80}. The 270000 edge is `≥`. The 48k ladder uses {0.90, 0.80, ¼}. At bitrate ≤ 96000 or ≤ 128000 there is a two-step ladder (0x76c0/0x7670, 0x78b4/0x75bc). 0x8000 means "never" and is returned when the narrow band is below a quarter of the total. The test saw all 16 distinct values.
+
+**4. `SSC_DRC_Exe` (0x70c4).** Globals run from `drc_struct` (0x120500): threshold, attack 0, release 0x3ca4a1, smoothed target, ramp start, last target; `DRC_ChNum` sits at 0x120518. Steps:
+- The peak (abs with INT_MIN wrap) and the count over the threshold run over `ChNum·n` values.
+- The block engages at an unsigned count ≥ 25. Its target is `(int32)((thr << 31) / (u32)peak) >> 9`, or 0x2000 at peak 0.
+- `g = (coef·smooth + (2^22 − coef)·target) >>> 22`. The coefficient is the release one when target > smooth, otherwise attack.
+- **One-block lookahead:** the ramp runs from the current gain to `min(last block's g, this g)`, in `(end − cur) / n` steps (32-bit sdiv). Each sample becomes `(gain·x) >>> 22`.
+- The ramp is skipped only when the current gain is exactly 2^22 and the step is 0.
+
+`SSC_DRC_Init(Fs, ch)` sets the gain to 2^22, the last target to 2^29 and ChNum. `SSC_DRC_SetPar(mode, thr)` sets the threshold, the coefficients and smooth = 2^22. `set_DRC_limit_gain` only writes the threshold.
+
+**5. Whole stage, frame by frame**, in `ssc_encode`'s order against the blob's pieces, comparing the PCM, the threshold, the biquad state and every global after each frame. It runs on synthetic signals and on 108 s each of Get Lucky (RAM album), Arctic Monkeys "Do I Wanna Know" and Nirvana SIDE-1 from 120 s. Every track goes through 10 configurations (the four E-mode rates, basic 229/96/328/128 at 48k/44.1k with bits=34, and bits=24 at 229/88), each at the plugin's level and 64× hotter. That is 12000 frames per run with no mismatch. Thresholds covered both scales (0x741d … 0x800000).
+
+At the plugin's level the gain is moving in 4487 of 12000 Get Lucky frames at UHQ (37 %) and in 4925 at basic-229. For Arctic Monkeys it is 0 at UHQ and 73 at basic-229 over these 108 s; for Nirvana, 0. So "fires on 0.3–1.2 % of blocks" (F43.4) turns into a gain that is still releasing for a third of the frames of a hot master. Each engagement takes ~180 blocks (~23 frames) to release, and the gain stays within ~0.85 dB of unity. It is inaudible (F41) but has to be bit-exact.
+
+**Progress.** The chain adds 1.67 KB (Biquad 276 B, powercalc 108, CalculateLimitGain 424, SSC_DRC_Exe 696, Init 92, SetPar 56, set_DRC_limit_gain 16). Verified bytes: 42.3 KB of 62.4 KB (**~68 %**). T4.7 is done. By objective: O0 100 %, O1 ~90 %, O2 ~45 %, O3 ~80 %, O4 ~66 %, O5/O6 0 %. The phase is about **57 %** done.
+
+## F45 pitch_search, tone_detect and patch_transient_decision are bit-exact (T4.6, exported part)
+
+Patch 0011 (`~/src/ssc-codec/harness/patches/0011-pitch-tone-detect-transient-bands.patch`, uncommitted) and three harness tests: `tone_detect`, `pitch_search` and `patch_transient`. The full suite passes, 46 tests in ~25 s (2026-10-26). The transcriptions come from the disassembly; `tone_detect` was also checked instruction by instruction, and this time the decompile was right.
+
+**1. `ssc_pitch_search` (0x12234, 1160 B)** is v1.1 `pitch_search` with two changes:
+- **No `x_lp4`/`y_lp4` normalisation.** The function has no maxabs or `clz`, so `shift` is always 0. The fine search is unshifted, and the second `find_best_pitch` gets yshift 1. Stock shifts whenever the pitch buffer goes above 2^11 after the LPC.
+- **`tone_detect(xcorr, best_pitch, maxcorr, max_pitch>>2)`** runs right after the coarse `find_best_pitch`, and its return value is ignored.
+
+Its buffers are `.bss` globals: `x_lp4` at 0x247a0, `y_lp4` at 0x24950 and `xcorr` at 0x24d18. These are file addresses; Ghidra adds 0x100000. `x_lp4` and `y_lp4` share scratch with `remove_doubling`'s `yy_lookup` at 0x247a0. The `ssc_encode` call is `pitch_search(pitch_buf+512, pitch_buf, 864, 979, &pitch)`, followed by `pitch_index = 1024 − pitch`, as in stock. `find_best_pitch` is **not** inlined (the plan was wrong about that): it is a static function at 0x126bc (724 B) and matches stock. Its NEON `Syy` sum rounds `len` up to a multiple of 8, which changes nothing for the real lengths, 216 and 432.
+
+**2. State across calls.** `tone_detect` reads `xcorr[hi+1]`. When the coarse best is lag 243, that read is `xcorr[244]`. The coarse search writes only [0, 244), so the value there is left over from the previous call's fine search, which writes [0, 489). The reference therefore keeps `xcorr` in a global, `ssc_pitch_xcorr`, which moves into the handle with OD8. After every call the test compares the blob's whole 489-entry global (`dladdr` base + 0x24d18) with the reference's. **Correction (F46.3):** inside `ssc_encode` this global is part of `in[]`, so the carried entry is `in[1071]` (an in_mem sample or `alg_quant` scratch), not the previous fine search's value.
+
+**3. `tone_detect` (0x12088, 428 B)** is Samsung-only:
+- The threshold is `(int64)maxcorr·30512 >> 15` (0.931·maxcorr). It returns 0 unless both candidates reach it.
+- Take `lo`/`hi` of the two candidates. The spacing is `d = hi − lo`, minus 1 if `xcorr[hi+1] ≤ xcorr[hi−1]`. If `d < 5` it returns 0.
+- The first lag `lo+i` (i = 2 … d−1) above the threshold resets `d = i`. It subtracts 1 when that lag beats its right neighbour and the left neighbour beats the right one too. Then `d < 5` or `d > n/2` returns 0.
+- It walks forward from `hi+d` to n−1 in steps of d, or d+1 when the right neighbour is ≥. Then it walks back from `hi−d` to lag 0 the same way. Every step needs `max(xcorr[j], xcorr[j±1]) ≥` the threshold.
+- On success, `best_pitch` becomes {the last forward position, that − d}, or that − d − 1 when the left neighbour is ≥. For a harmonic tone it therefore picks the longest-lag pair.
+
+**4. `ssc_patch_transient_decision` (0xa170, 508 B)** is v1.1's function restricted to the upper bands:
+- The spreading starts at band 13, over both channels of `oldE`, and the backward pass also stops at 13.
+- The mean covers bands 13 … end−2 of **channel 0 of `newE` only** and is divided by end−14. It returns `mean > 1.0` (1024), or 0 when end ≤ 14.
+- Stereo is hard-coded, so there is no C parameter. The decompile hid the return value; it shows up as an argument to `__stack_chk_fail`.
+
+In `ssc_encode` the call is `(bandLogE, oldBandE, nbEBands, *(int*)(st+0x14) − previous_uhq_index)`, behind the stock gate (`ec_tell+3 ≤ total_bits`, not already transient). The `end − previous_uhq_index` argument is for T4.8.
+
+**5. Validation.**
+- **Synthetic cases:** random, tie-heavy (quantised to M/16, near-silence with maxcorr=1 and threshold 0) and crafted edges (peaks at the threshold; lo=0 with hi=n/2). `tone_detect` fires in 210 of 3000 cases and `patch_transient` in 319 of 3000.
+- **Music:** 108 s each of Get Lucky (RAM), Arctic Monkeys "Do I Wanna Know" and Nirvana SIDE-1 from 120 s at 96 kHz, plus Get Lucky at 48 kHz. Each frame goes through `pitch_downsample` and then `pitch_search` (`DT_PITCH_MUSIC`): 41992 frames, no mismatch, full `xcorr` state included.
+- **Stock v1.1 for comparison:** it differs on 450 of 2000 synthetic cases, but on only 1–4 frames per 108 s of music. The changes rarely matter on music, but bit-exactness needs them.
+- **Mutation:** 26 mutants, 24 caught. Two survive:
+  - `v >= next` in the first-peak adjustment is equivalent: it is reachable only at i=2, where d ≤ 2 returns 0 either way.
+  - Zeroing the stale `xcorr[244]` matters only when the coarse best is lag 243 and hi−lo sits at the d=5 boundary. It is covered by composition: the state comparison plus the direct test, which reads `xc[n]`.
+
+**Progress.** This batch adds 2.82 KB (`pitch_search` 1160 B, `find_best_pitch` 724, `tone_detect` 428, `patch_transient_decision` 508). Verified bytes: 45.1 KB of 62.4 KB (**~72 %**). Left: `ssc_encode` 16.6 KB and `encoder_init`/create 0.6 KB. T4.6 is done except transient_analysis, tf_analysis and dynalloc, which are inlined into `ssc_encode` and land with T4.8. By objective: O0 100 %, O1 ~90 %, O2 ~45 %, O3 ~80 %, O4 ~70 %, O5/O6 0 %. The phase is about **59 %** done.
+
+## F46 The native `ssc_encode` is bit-exact (T4.8)
+
+New in `~/src/ssc-codec/harness` (uncommitted): `ssc_encoder.c`/`.h` (the native encoder; the headroom and DRC transcriptions moved here from `difftest.c`), `ssc_abi.h` (the blob's layouts, including the encoder handle), `trace.c`/`.h`, `trace_calls.h`, `trace.list`, patches **0012** and **0013**, and the `encode` test. The full suite has 47 tests and passes in ~45 s (2026-10-26).
+
+**1. Probe: every call `ssc_encode` makes is observable.** `ssc_encode` reaches all exported functions through the PLT, including the range coder (`ssc_ec_enc_bit_logp`, `_icdf`, `_uint`, `_bits`, `_done`). `difftest` exports wrappers under those names (`-Wl,--dynamic-list=trace.list`), and the blob, dlopened with `RTLD_NOW`, binds to them. Each wrapper records its arguments and results, then calls the blob's own definition (`dlsym` on the blob handle). Only depth-0 calls are recorded, the ones `ssc_encode` makes itself. The reference records the same calls through the same helpers, so a frame compares as two text traces (~86 records at 584k). The first differing record names the section. This also does T2.3's job (golden vectors at every function boundary) without gdb. Patch 0009's `ssc_mdct_forward` shares a name with a wrapper, so the reference build renames it with `-D`.
+
+**2. What `ssc_encode` is:** v1.1's `celt_encode_with_ec` with C=2, LM=3, CBR (`st->bitrate` stays −1, no VBR) and start=0, plus the following. `ssc_encoder.c` includes the patched `celt_encoder.c` and reuses its static `tf_analysis`, `stereo_analysis` and `alloc_trim_analysis` unchanged.
+- **Two flags from the bitrate, not one.** *E header* (byte 1 = `e0 | counter>>4`): 152, 250, 291, 308, 442, 584 and 886k. *uhq*: those plus **256k and 328k**, which carry F tags (`f6`, `f5`). uhq selects the E-mode DRC coefficients and threshold scale, input `<<4` (24-bit), `uhq_headroom`, no tf analysis or TF symbols, and no 3/128 extra bytes. So 256k/328k frames are F-tagged but take the 24-bit path; F40's 16-bit nominal level holds only for 88/96/128/192/229k. Unknown bitrates get tag `f3` and neither flag. An early `set_DRC_limit_gain` (0x7b4c00, 0x79f800, 0x76f2/0x78b4/0x7a94, the last three `<<8` when bits=24) is always overwritten before `SSC_DRC_Exe`.
+- **Input.** The DRC limits `pcm` in place (F44), then sample_max (v1.1, abs wrapping at INT_MIN) and the silence bit. The pre-emphasis is a shift only: `<<4` on the uhq path or with bits=24, otherwise `<<12`.
+- **Prefilter:** v1.1's `run_prefilter`, gated by nbAvailableBytes ≥ 25 and not silence, with tapset 0 and no tapset symbol (patch 0008). Threshold, qg and the gain hold are stock.
+- **No time-domain `transient_analysis`.** `isTransient` comes only from `patch_transient_decision` (gate `tell+3 ≤ total_bits`, end − previous_uhq_index). `tf_estimate` is 0, or 0.2 after a patched transient, and `tf_chan` is 0. A transient reruns 16 short MDCTs, headroom and the energies, and adds 1.5 to bandLogE2.
+- **Top-band cut:** at bitrate < 192000, the long-MDCT bins from `8·eBands[21]` up are zeroed in both channels. After a transient re-MDCT the cut is applied only on the non-uhq path.
+- **Adaptive end** (F34.3): the last-band scan picks idx (152k: always 4). `end − idx` goes to normalise, coarse energy, spread, dynalloc, stereo/intensity/trim, allocation (signalBandwidth `end − idx − 1`), fine energy, PVQ and finalise. tf_analysis, tf_encode, coarse energy's first argument and the band energies use all 22 bands.
+- **TF** (non-uhq only, gate 15·C ≤ bytes): stock tf_analysis with lambda 24/12/8/6, then **`tf_res[0]` and `tf_res[1]` are forced to `isTransient`**, then stock tf_encode. On the uhq path `tf_res` is all 0 and nothing is coded (F37).
+- **Dynalloc:** stock analysis with **lsb_depth 16** (noise floor constant −6.5 dB, `0xe600`). The 1/4-budget cap is **`effectiveBytes·16 − tot_boost`** (disassembly 0xe558–0xe570; v1.1 rounds to `(effectiveBytes/4)<<6`). If the cap isn't hit, a **band 0/1 boost** follows, up to 10 quanta, on bandLogE2:
+  - band 0: `lvl = min(E[0], E[22]) − 6500`, `drop = min(E[0]−E[1], E[22]−E[23])`. If both > 0: `((max(drop,1500) − 1500) >> 7) + (lvl>>3 & 0x1fff)/25`.
+  - band 1: `lvl = min(E[1], E[23]) − 6100`, `drop = min(E[1]−E[2], E[23]−E[24])`, `rise = min(E[1]−E[0], E[23]−E[22])`. If all > 0: `(drop − 1700)/160 + (lvl>>3 & 0x1fff)/25`.
+  - Each result raises that band's offset. The dynalloc symbols themselves are stock, over `end − idx` bands.
+- **Band 18–21 carry-over, after the dynalloc symbols and unsignalled:** if offsets[18] > 1000 and offsets[19] = 0, and the quantised oldBandE[19] > 7000 or oldBandE[18]/2 < oldBandE[19], then offsets[19] = offsets[18]. Otherwise the same for 19→20, otherwise for 20→21. The allocation uses the result. **A decoder must redo this**, since it has both inputs; patch 0010 does not yet.
+- **Intensity is constant.** `hysteresis_decision(510, tables@0x3d18/0x3d46, 22−idx, prev)` has 23-entry Samsung tables, all below 510 − hysteresis. It returns N (or prev when prev > N), so intensity is always `end − idx`, and the native encoder needs neither table (OD7).
+- **Trim:** stock, tilt over `end − idx`; `trim_icdf` at 0x3d74 is stock's. **Allocation:** table selector bitrate > 192000 (F34.4), stock anti-collapse reserve.
+- **Epilogue:** stock, except: bands dropped by idx get **oldBandE = −28 dB** (v1.1's decoder sets bands above end to 0); **oldLogE2 is never updated**; `previous_uhq_index = idx`; the frame counter wraps at 0xff. It returns `nbCompressedBytes + 4`, or −3 on a range-coder error.
+- **Init** (`ssc_encoder_init`): stock reset values, but oldLogE/oldLogE2 stay 0 (not −28) and `end` = effEBands (21) until the first frame sets 22. Then `SSC_DRC_Init`/`SetPar(0x7b8e)` and `previous_uhq_index = 0`.
+
+**3. Hidden state: `ssc_encode`'s `in[]` is the global `in_shared` (0x2402c), and other scratch lives inside it.** pitch_search's `xcorr` (0x24d18) is `in[827..1316)`, and `alg_quant`'s `iy`, `y` and `signx` (0x24dac, 0x24fec, 0x2522c) are `in[864..)`, `in[1008..)` and `in[1152..)`. The comb filter rewrites all of that after the pitch search, so the one value that crosses frames is **`in[1071]`**, which `tone_detect` reads as its stale `xcorr[244]`. It holds the in_mem sample the previous frame's prefilter copied there, or `y[126..127]` from the last `alg_quant` call with N ≥ 128 after it. **This corrects F45.2:** in `ssc_encode` the carried entry is not the previous fine search's value (that holds only when `pitch_search` is called on its own, as in its test). The reference keeps `in[]` in the encoder (OD8). Before `pitch_search` it seeds `ssc_pitch_xcorr` from `in[827..]`, and patch 0012 lets `alg_quant` use the blob's offsets in that buffer (`ssc_vq_scratch`). `tf_analysis` also uses `in[0..282)` as scratch, but nothing reads that back.
+
+**4. Validation** (`encode` test, fresh blob and reference handles per configuration; 21 configurations: 96k at 584/442/886/308/291/250/152k, and 48k and 44.1k creates at 229/328/256/192/128/96/88k. The first music runs below used the first 15, without the 44.1k creates other than 229k). Each frame compares the return value, the bytes, the whole handle (0x08–0x2548), the DRC globals, `previous_uhq_index` and `in_shared[282..)`. Synthetic frames also compare the trace.
+- Synthetic, the T2.2 corpus as generated 20-frame segments: white noise, three tones, silence and gated noise, loud/quiet bursts, dynalloc peaks (a band-1 tone plus a tone stepping through bands 18–20), 100 Hz + 1 kHz, 15 kHz + 30 kHz (20 kHz at 48k), a 20 Hz–Nyquist log sweep, pink noise with castanet-like clicks, and a full-scale sine clipped 12 dB over. 200 frames × 21 configurations, all match.
+- Music at the plugin's level (2^23 on the 24-bit path, 2^15 on the 16-bit one): 30 s each of Nirvana SIDE-1 (from 120 s), Get Lucky (RAM) and Arctic Monkeys "Do I Wanna Know", resampled to 96k and 48k. That is 3333 or 1666 frames per configuration, ~110 000 frames in all, with no difference. Each track takes ~90 s under qemu without tracing.
+- 30 s of Get Lucky on all 21 configurations, 6 bits hot (the old 2^29 plugin level, where the limiter rides hard, F38.7), 8 bits hot (int32 full scale) and with bits=24: all match, decoder included. No band energy reached 2^29 in any of them, so OD20's `amp2Log2` overflow is not reached through `ssc_encode`.
+- Branches reached (synthetic + Get Lucky): prefilter on, patched transients, silence, the cut, idx > 0, the dynalloc cap, both boosts, the carry-over (3–7 frames per configuration, synthetic only; never on the music), anti-collapse and tf_select = 1.
+- Decoding: since 0013, the test also decodes every blob frame with the patched decoder. No frame has a range error, and the decoder's `oldBandE` equals the encoder's after every frame, carry-over frames included. Removing either half of 0013 fails within ~80 frames (−28 reset) or ~165 frames (carry-over).
+- Mutations (22, one at a time, synthetic): every one is caught except these.
+  - Equivalent on all live inputs: the stock cap (confirmed in the disassembly instead), exact-tie boundaries (`> 7000`, `> 12001`, `> 30001`), and the nbAvailableBytes 25 gate (no live frame is that small).
+  - Visible only in the trace: normalise's end, the hysteresis return value, and the transient-path cut on uhq.
+  - Not reached in 200 frames: the frame-counter wrap (music reaches it), and `in[1071]` seeding (see §5).
+
+**5. Decoder consequences (patch 0013, `ssc_header.h`).**
+- The band 18–21 carry-over and the −28 dB restart of dropped bands are not in the bitstream. A v1.1-based decoder gets the allocation wrong on carry-over frames, with no range error, and predicts a returning band's coarse energy from 0. 0013 mirrors both (`ssc_mode != 0`) and adds a ctl that exposes the decoder's `oldBandE`.
+- 256k and 328k frames have F tags but no TF symbols and no 3/128 pad. The header parser now sets `uhq` for them and the decoder uses E-mode TF handling, so the old `e_mode` switch would have desynced both rates. F38/F40 measured only 584/152/229k, so no earlier result changes.
+- The buds' decoder presumably does both too, or Samsung's own frames would not decode.
+
+**6. The blob breaks the AArch64 calling convention.** `ssc_amp2Log2` (and its `_asm` kernel), `ssc_alg_quant` and `ssc_comb_filter_function3/4_asm` write v8/v9 (for example `dup v8.2s` at 0x158dc, `sshr v8.4s` at 0x16e34) without saving them. AAPCS64 makes d8–d15 callee-saved, so a caller that keeps a floating-point value in one of them across `ssc_encode` gets it corrupted. That bit the harness: GCC inlined the synthetic generator into the frame loop and kept `amp * .3` in d8, so from about frame 22 the tone and sweep segments came out as zeros. Both encoders got the same zeroed PCM, so no comparison was wrong; the generator is now `noinline`. It is harmless in the plugin, where the blob runs alone in `ssc_blob_helper` under qemu, and on the phone as long as libbluetooth_jni holds no floats across the call. A native encoder doesn't have the problem. Earlier `decode`-test tone runs may also have encoded partly silent tones; their checks compare what was actually fed, so they stay valid but cover fewer frames.
+
+- Five minutes each of the three tracks on all 21 configurations (Arctic Monkeys: its full 272 s): 1 357 034 frames, all bit-exact, decoder included. The frame counter wraps several times per run.
+
+**7. Not covered yet.** A direct test of the stale-`in[1071]` read inside `ssc_encode`. It needs a coarse pitch at lag 243 at the `tone_detect` boundary, which no input here produced. The state itself is compared every frame (`in_shared[282..)`).
+
+**Progress.** `ssc_encode` (16.6 KB) and init/create (0.6 KB) are verified, so all 62.4 KB of live encoder code is bit-exact against the blob on the inputs above (**100 %** of bytes; T4.8's long-run and corpus checks remain). By objective: O0 100 %, O1 ~90 %, O2 ~70 % (T2.3 done by the trace, T2.2 corpus not built), O3 ~80 %, O4 ~95 %, O5/O6 0 %. The phase is about **68 %** done.
+
+## F47 The native encoder runs outside qemu, bit-exact, at ~2 % of a core (O5 start)
+
+New, uncommitted:
+- in `~/src/ssc-codec`: `native/` (Makefile, `ssc_native.c`/`.h`, `ssc_native_helper.c`, `ssc_native_bench.c`), `tools/ssc-extract-tables.py`, `tools/helper_compare.py`, and an `SSC_NO_TRACE` switch in `harness/trace.h`;
+- in ssc-uhq: `config/bin/sscenc-blob-run` (a tracked copy of the live launcher, plus a backend switch) and the plugin patch's 256k/328k level fix (§4).
+
+**1. Build.** `make -C native` builds libopus v1.1 + patches 0001–0013 + `harness/ssc_encoder.c` for x86_64. `tools/ssc-extract-tables.py` writes `native/build/ssc_tables.h` from the user's blob: both static modes (resolved through the blob's `R_AARCH64_RELATIVE` relocations at 0x1b9c0/0x1ba40), `headroom_gain`, and the biquad coefficients. It checks the blob's sha256 and the mode fields, and the output is gitignored (D28, OD7). `ssc_native.c` builds the CELTModes the way the harness's `build_mode` does.
+
+**2. Bit-exact on x86_64.** `tools/helper_compare.py` feeds the same PCM, at the plugin's level, to openssc's `ssc_blob_helper` under qemu and to `ssc_native_helper`. On 30 s of Nirvana, Get Lucky and Arctic Monkeys, on all 21 configurations, every frame is identical (63 runs, ~140 000 frames). So the aarch64 harness result (F46) carries over to the host compiler: the code has no architecture-dependent behaviour that the corpus reaches.
+
+**3. CPU (AC5).** `ssc_native_bench` times encoding in-process: 5 minutes of music, i7-10510U, `-O2`, no `-march`, and a busy machine (load average ~10).
+
+| Configuration | Track | p50 / p99 per frame | Share of one core at real time |
+|---|---|---|---|
+| uhq-584 | Get Lucky | 0.23 / 0.39 ms | 2.7 % |
+| uhq-886 | Get Lucky | 0.19 / 0.39 ms | 2.3 % |
+| uhq-152 | Get Lucky | 0.10 / 0.21 ms | 1.3 % |
+| basic-229 | Get Lucky | 0.18 / 0.37 ms | 1.1 % |
+| uhq-584 | Nirvana, 3 runs | 0.32–0.35 / 1.0–4.1 ms | 3.7–4.9 % |
+
+Measured again with my background runs stopped (the live plugin helper and a desktop session still running): uhq-584 takes **1.9 %** on Nirvana and **1.8 %** on Get Lucky (p50 0.15 ms, p99 0.31 ms). The earlier spread came from load, part of it from the tee recursion below. The budget is 9 ms per frame at 96 kHz; the helper's pipe round trip adds ~0.05 ms; qemu ran the blob at ~10 % (F42). **AC5's CPU half (< 5 % of one core at uhq-584) is met** with margin. Its other half, sounding identical, is T5.3.
+
+**4. 256k and 328k at 48 kHz are fed 8 bits too quietly by the plugin.**
+- F46.2 found that these bitrates take the 24-bit path. The plugin patch (D34) drops every non-96k rate to 16-bit.
+- `decode` test, Get Lucky resampled to 48 kHz, 20 s, gain relative to the source:
+
+  | Bitrate | Fed 2^15 | Fed 2^23 |
+  |---|---|---|
+  | 229k | 0.988 (26.6 dB) | 1.56 (3.8 dB, the limiter rides, F40) |
+  | 256k | **0.0039** (−48 dB) | 0.988 (27.0 dB) |
+  | 328k | **0.0039** (−48 dB) | 0.988 (28.0 dB) |
+
+  So at the plugin's current level, 256k and 328k would play 48 dB low on the buds. That assumes the buds decode those frames at the same scale as our decoder, which matched by ear at 229k.
+- Only profiles chosen through `SSCENC_PROFILE` reach these rates: basic-256, basic-328, force-high, basic-max, top-basic, open-basic-256/328. `ssc-switch` offers none of them. F41's "every profile sounds good" covered the ssc-switch profiles.
+- Fixed in `config/ssc-pipewire-1.6.8.patch`: the 8-bit drop now skips 256000 and 328000. It applies to a fresh 1.6.8 tree and `encoder.c` compiles with `-Wall -Wextra`. **The installed plugin is not rebuilt.**
+
+**5. Backend switch, not installed.**
+- `config/bin/sscenc-blob-run` keeps the live launcher's blob branch byte for byte (`SSCENC_BACKEND` unset or `blob`).
+- `native` execs `~/.local/libexec/sscenc/x86_64/ssc_native_helper`, or `SSCENC_NATIVE_HELPER`.
+- `tee` (T5.2) runs the native helper with the blob branch as `SSCENC_TEE_CMD`. It sends the blob's frames, so the live sound doesn't change, and logs every differing frame to stderr (the journal).
+- Tested through the launcher, including systemd-run + qemu: 1000 frames at uhq-584 and 1000 at basic-229, 0 differ. A fake blob at another bitrate shows the mismatch report working.
+- The plugin needs no rebuild for this: it already execs the launcher and passes its environment.
+- **Installed and live, 2026-10-26 18:23.** The launcher went to `~/.local/libexec/sscenc/sscenc-blob-run` (the old one is kept as `sscenc-blob-run.pre-d35`) and the helper to `~/.local/libexec/sscenc/x86_64/ssc_native_helper`, the same sha256 as `native/build`. `Environment=SSCENC_BACKEND=tee` is in `~/.config/systemd/user/wireplumber.service.d/sscenc.conf` and in the repo copy; `ssc-switch uhq` applied it.
+- `ps` shows WirePlumber → `ssc_native_helper 96000 2 34 584000` → systemd-run → qemu `ssc_blob_helper`, with the sink RUNNING at uhq-584. After 70 s of the user's playback (~7800 frames) the journal has no `tee:` line; any of the first ten mismatches would have been logged at once.
+- The helper prints a progress line only every 100 000 frames (~15 min at 96 kHz) and a summary (`tee: done, N frames, M differ`) when the stream closes.
+
+**6. Live results (2026-10-26).**
+- Tee at uhq-584: the journal has `tee: done, 21235 frames, 0 differ` (18:26:55) and `tee: done, 2550 frames, 0 differ` (18:27:29), so 23 785 live frames matched. A third stream ended at a WirePlumber restart before writing its summary.
+- The user then set `SSCENC_BACKEND=native` themselves (live `sscenc.conf`, tee line commented out) and reported **"sounds really good on native"**. That is the T5.3 listening result: uhq-584, the user's own playback, no blind A/B. Native output is byte-identical to the blob's on every frame checked, so it can't sound different; the listening confirms the path works end to end (plugin → native helper → buds).
+- At 18:30 WirePlumber's environment had `SSCENC_BACKEND=native` and the sink was suspended. The live encoder is now native, without qemu.
+
+**Pitfall.** The tee child must not inherit `SSCENC_TEE_CMD`. When it did, a test that used the native helper as the "blob" recursed until it was killed. The helper now unsets it before the exec.
+
+## F48 Function classification, final (T1.3 done, AC2)
+
+Supersedes F30's table: it covers **all 85 exported functions** of the S24U blob (`readelf --dyn-syms`, FUNC, defined) by full name, plus the 7 unexported statics on live paths. Class, patch and test come from F31, F33, F34, F43–F46; nothing here is new evidence except §1 and the three create/destroy/get_size rows.
+
+**1. Reachability, mechanical** (2026-10-26, `objdump -d` + a call-graph walk from the four API entry points; the blob has no `blr`, and its 76 `br` are all PLT stubs). **69 exports are live, 16 are dead**, and the dead set is exactly F30's D row. The live statics are exactly F30's seven `FUN_*`. The other call targets are libc (`memcpy`, `memset`, `malloc`, `free`, `__stack_chk_fail`); `printf` is called only from dead code (`print_enc_fields`).
+
+Legend as F30: **S** stock · **F** stock logic, specialised (C=2, LM=3, start=0, enc-only) · **M** modified · **N** Samsung-only · **D** dead · **API** entry point. Patches are `~/src/ssc-codec/harness/patches/`; 0001 (exact `MULT32_32_Q31`) and 0002 (24-bit range coder) are library-wide, so every caller of those macros carries them. "encode" means covered only through the whole-frame `encode` test (bytes, handle, globals, and the PLT trace for the traced calls, F46).
+
+| Exported function | libopus v1.1 | Class | Patch | Test |
+|---|---|---|---|---|
+| ssc_encoder_get_size | opus_custom_encoder_get_size | API, F | | encode (handle size) |
+| ssc_encoder_create | opus_custom_encoder_create | API, F | | encode |
+| ssc_encoder_destroy | opus_custom_encoder_destroy | API, S | | (a tail call to `free`) |
+| ssc_encode | celt_encode_with_ec | API, **M** | 0008, 0011, `ssc_encoder.c` | encode |
+| ssc_encoder_init | opus_custom_encoder_init | **M** | `ssc_encoder.c` | encode (handle after init) |
+| ssc_custom_mode_create | opus_custom_mode_create | **M** | tables extracted (OD7) | modes |
+| ssc_ec_enc_init, ssc_ec_encode, ssc_ec_encode_bin, ssc_ec_enc_bit_logp, ssc_ec_enc_icdf, ssc_ec_enc_uint, ssc_ec_enc_bits, ssc_ec_enc_shrink, ssc_ec_enc_done, ssc_ec_tell_frac | entenc.c / entcode.c | **M** | 0002 | ec |
+| ssc_ec_laplace_encode | ec_laplace_encode | S (on 0002) | | ec |
+| ssc_rcp, ssc_sqrt, ssc_rsqrt_norm, ssc_cos_norm | mathops.c | S | | rcp, sqrt, rsqrt_norm, cos_norm (exhaustive where cheap) |
+| ssc_bitexact_cos_asm | bitexact_cos ×2 | F (two lanes, int32 out) | | bitexact_cos (exhaustive 1…16383); differs only outside compute_theta's domain (F33.4) |
+| ssc_frac_div32 | frac_div32 | S (on 0001) | 0001 | frac_div32, frac_div32_variants |
+| ssc_haar1, ssc_hysteresis_decision | bands.c | S | | haar1, hysteresis_decision |
+| ssc_encode_pulses | encode_pulses | S (on 0002) | | encode_pulses |
+| ssc_alg_quant | alg_quant (+ exp_rotation) | **M** | 0003, 0012 | alg_quant |
+| ssc_stereo_itheta | stereo_itheta | F (stereo=1, on 0001) | 0001 | stereo_itheta |
+| ssc_compute_band_energies | compute_band_energies | F | | band_energies |
+| ssc_normalise_bands | normalise_bands | F (in place) | | normalise_bands |
+| ssc_amp2Log2, ssc_amp2Log2_asm | amp2Log2 | F (n=22, NEON pairs) | | amp2Log2 |
+| ssc_spreading_decision | spreading_decision | **M** | 0005 | spreading_decision |
+| ssc_quant_coarse_energy | quant_coarse_energy | **M** | 0006 | coarse_energy |
+| ssc_quant_fine_energy | quant_fine_energy | F | | fine_energy |
+| ssc_quant_energy_finalise | quant_energy_finalise | F | | energy_finalise |
+| ssc_compute_allocation | compute_allocation (+ interp_bits2pulses) | F (frame struct, F33.5) | | compute_allocation |
+| ssc_quant_all_bands | quant_all_bands | **M** | 0007 | quant_all_bands |
+| ssc_patch_transient_decision | patch_transient_decision | **M** | 0011 | patch_transient |
+| ssc_pitch_downsample | pitch_downsample | F (C=2, len 1888) | | pitch_downsample |
+| ssc_pitch_search | pitch_search | **M** (no lp4 shift, calls tone_detect) | 0011 | pitch_search |
+| ssc_remove_doubling | remove_doubling | **M** | 0004 (code-read only, OD12) | remove_doubling, remove_doubling_loud |
+| ssc_pitch_xcorr_c1, ssc_pitch_xcorr_c2 | celt_pitch_xcorr | F (two fixed-shape variants) | | pitch_xcorr_c1, pitch_xcorr_c2 |
+| _ssc_lpc | _celt_lpc | F (order 4, on 0001) | 0001 | lpc |
+| _ssc_autocorr | _celt_autocorr | F (n 944, lag 4) | | autocorr |
+| ssc_comb_filter, ssc_comb_filter_const_asm, ssc_comb_filter_function1_asm, ssc_comb_filter_function2_asm, ssc_comb_filter_function3_asm, ssc_comb_filter_function4_asm | comb_filter | **M** (NEON, tapset 0, Q31) | 0008 | comb_filter |
+| ssc_fft | opus_fft | **M** (rewrite: Q31, radix 4/3, compact state) | 0009 (`ssc_mdct.c`) | fft |
+| ssc_mdct_forward | clt_mdct_forward | **M** (rewrite: Q31 window/trig, exact π/4N rotation) | 0009 | mdct_forward, mdct_tables |
+| ssc_compute_band_energies_for_lastband | — (stock compute_band_energies on slices) | **N** | | lastband_energies |
+| tone_detect | — | **N** | 0011 | tone_detect |
+| normal_headroom, uhq_headroom | — | **N** | `ssc_encoder.c` | headroom |
+| SSC_DRC_Init, SSC_DRC_SetPar, set_DRC_limit_gain | — | **N** | `ssc_encoder.c` | drc_exe, drc_chain, encode |
+| SSC_DRC_Exe | — | **N** | `ssc_encoder.c` | drc_exe, drc_chain |
+| CalculateLimitGain | — | **N** | `ssc_encoder.c` | drc_limitgain |
+| powercalc | — | **N** | `ssc_encoder.c` | drc_powercalc |
+| Biquad_Narrow_int2int_stereo | — | **N** | `ssc_encoder.c` | drc_biquad |
+| SSC_COPY8, SSC_COPY16, SSC_COPY32, SSC_CLEAR | OPUS_COPY / OPUS_CLEAR | N (trivial) | | encode (20 call sites) |
+| ssc_preemphasis, headroom_process, get_header_from_bitrate, get_uhq_info_from_bitrate, set_limit_gain_from_bitrate, set_data_header, set_data_frame_header, last_band_info_calc, CalculateBandEnergy, CalculateBandEnergyLastBand, getPitchIndexGain, getPitchFilterThreshold, prefilter_gain_calculation, print_enc_fields, smull32_x86_scalable, ssc_ec_enc_patch_initial_bits | — | **D** | | none needed |
+
+| Live static (Ghidra address) | libopus v1.1 | Class | Covered by |
+|---|---|---|---|
+| FUN_0010f88c | ec_enc_carry_out / normalize | M (0002) | ec |
+| FUN_00113734 | quant_coarse_energy_impl | F | coarse_energy |
+| FUN_001126bc | find_best_pitch | S (NEON `Syy`, F45.1) | pitch_search |
+| FUN_001167d0 | exp_rotation | S | alg_quant |
+| FUN_00109038, FUN_00109460, FUN_00109ca4 | quant_band, quant_partition (+ compute_theta), intensity_stereo | F | quant_all_bands |
+
+**2. Create, destroy, get_size** (read from the disassembly at 0xa0b8, 0xa16c, 0x9f0c). `ssc_encoder_get_size(C, Fs)` = `C·(4·overlap + 6·nbEBands + 4096) + 0xdc`, which is v1.1's formula in fixed point (int32 `in_mem` and `prefilter_mem`, three int16 band-energy arrays) with the frame size fixed at 864. `ssc_encoder_create(Fs, C, bits, &err)` inlines it, `malloc`s, calls `ssc_encoder_init(st, Fs, C, bits)`, frees on error, and reports −7 (OPUS_ALLOC_FAIL) when malloc fails, as stock does. `ssc_encoder_destroy` is a tail call to `free`.
+
+**3. Count by class.** Of the 69 live exports (counted from the table): API 4, S 9, F 14, M 27 (10 range-coder entry points under 0002 and 6 comb-filter symbols under 0008, so 13 distinct changes), N 15 (4 of them trivial copies). The Samsung-only and modified code is all in the patch series or `ssc_encoder.c`, and every live function is covered by a harness test, directly or through `encode`.
+
+## F49 The stale `in[1071]` read is reached often and never reaches the output (closes F46.7)
+
+F46.7 left a direct test of the stale read open, "no input here produced" a coarse pitch at lag 243. It turns out to be common. What never happens is the read changing anything downstream, so no natural input can drive a byte-level test of it.
+
+**Method** (2026-10-27, x86_64, `native/build/libsscenc.a`; a scratch probe, not kept). Each frame is encoded from a saved copy of the handle twice: once as is, and once with `in[1071]` set to 0, `INT32_MAX` and `−INT32_MAX` in turn. Between them those three values flip `xcorr[244] ≤ xcorr[242]` either way. A scratch copy of the patched `pitch.c` counts three things:
+- the calls where both candidates pass the threshold and `hi + 1 == max_pitch`, the stale read;
+- whether `tone_detect`'s result changes when that comparison is forced each way;
+- `pitch_search`'s return value in each run.
+
+| Input | Frames | Stale read | Decides `tone_detect` | `pitch_search` differs | Bytes differ |
+|---|---|---|---|---|---|
+| Get Lucky, Do I Wanna Know, Nirvana SIDE-1 (240 s each, plugin level) at 96k/584k, 96k/152k, 48k/229k, 48k/96k | 239 996 | 31 120 (1.7–22 % per run) | 8 | 0 | 0 |
+| Harmonic tones, f0 20 Hz–2 kHz in 1 % steps, 40 frames each, at 96k/584k and 48k/229k | 37 040 | 7 674 | 0 | 0 | 0 |
+
+**Why it is absorbed.** With `hi = max_pitch − 1 = 243` the forward walk never runs, so `top = hi` and `best_pitch[0]` keeps the coarse best. Only `best_pitch[1]` (`top − d`, possibly −1) moves, by one coarse lag. The fine search evaluates ±2 around twice each candidate. Its two windows overlap and its winner sat in the same place every time. `pitch_search` then rewrites `xcorr[0..489)`, so no state differs after the frame either.
+
+**Consequences.**
+- The reference keeps seeding `ssc_pitch_xcorr` from `in[]` (D30): it costs nothing, and the function-level `pitch_search` test still shows the read matters there (F45.5).
+- The encode test's per-frame `in_shared[282..)` comparison stays the guard. A dedicated test is not planned.
+- This is not a proof. A fine-search maximum sitting exactly at a window edge near `lo` could still leak the stale value. None of ~277 000 frames did.
+
+## F50 Native decoder tools; real phone→buds frames decode in sync; spectrograms (T3.3 done)
+
+New, uncommitted, in `~/src/ssc-codec/native`:
+- `ssc_native_dec.h`, the decoder set up as the harness's `decode_one`. It is the encoder's
+  mode plus a v1.1 inverse MDCT, with the alloc table chosen per frame from the header.
+- Two tools, `ssc_native_roundtrip` (encode, decode, SNR, WAV) and `ssc_native_decode`
+  (`u32 len | bytes` frames → WAV, with the decode test's sync check).
+- A `ssc_native_tables()` accessor in `ssc_native.c`.
+
+The helper doesn't call the new code. `helper_compare.py` after the rebuild: 5 configurations × 3000 frames, identical. The installed helper was not replaced (nothing it does changed).
+
+**1. Every capture we have decodes in sync, with a negative control.**
+
+| Frames | Source | Mode | Result | Same frames, other mode |
+|---|---|---|---|---|
+| `ssc-capture/btsnoop_hci.log`, 12 455 frames, 225 s | **Galaxy A31 → Buds, over the air** (older, basic-only encoder; F-mode 192k, 484 B, header `ff ee xx f3`) | 48k | 0 header, range or sync errors; the range coder ends within 1 bit of the payload on all but 6 padded frames; RTP sequence has no gaps | 4190 range errors |
+| `uhq584_getlucky.frames`, 6666 frames | S24U blob, uhq-584 | 96k | 0 errors; end 19/20/21/22 = 3121/3513/8/24 and 914 padded, exactly the qemu harness's numbers (F38.6) | 2445 range errors, 165 out of sync |
+| `golden/*.golden`, 16 frames each | SSCOnWindows: 128k, 192k, 229k (48k mode); 250k, 442k, 584k (96k mode) | as listed | 0 errors | 2–7 range errors per file |
+
+The A31 capture matters most. It is a different Samsung encoder build, its frames went over the air, and the buds played them. Our decoder reads them in sync on the S24U blob's 48k tables, with the shared alloc table (192k is not > 192000) and patches 0010/0013. The output is plausible music: mean −20.6 dBFS, peak −3.6 dBFS, harmonics and transients up to ~23 kHz, with a visible step at ~19.6 kHz. So for basic 192k, the A31's bitstream, tables included, is the one our decoder assumes. Extractor: a few lines over `parse_btsnoop.py`'s `l2cap_frames` (outgoing AVDTP media channel, RTP header stripped). It lived in a session scratch dir and is easy to rebuild.
+
+**2. Native round trip, every configuration.** 240 s each of Get Lucky (m1), "Do I Wanna Know" (m2) and Nirvana SIDE-1 (m3), resampled to 96k or 48k at the plugin's level, through all 21 configurations. That is 1 119 972 frames, byte-identical to the blob's (F47), with **no decode error**. Waveform SNR (both channels, from frame 2, gain 1):
+
+| Config | m1 | m2 | m3 |
+|---|---|---|---|
+| 96k 886k / 584k / 442k | 37.8 / 34.4 / 30.9 | 43.5 / 40.7 / 35.0 | 38.2 / 29.6 / 26.5 |
+| 96k 308k / 291k / 250k | 27.8 / 27.2 / 26.3 | 32.3 / 31.9 / 30.9 | 25.0 / 24.7 / 24.1 |
+| 96k 152k | 22.7 | 23.7 | 20.9 |
+| 48k 328k / 256k (24-bit path, F46.2) | 28.3 / 27.0 | 33.9 / 30.1 | 33.1 / 29.6 |
+| 48k 229k / 192k / 128k | 26.5 / 25.4 / 22.6 | 28.6 / 27.4 / 23.0 | 28.2 / 26.9 / 22.4 |
+| 48k 96k / 88k | 19.8 / 19.4 | 20.4 / 19.6 | 20.0 / 19.2 |
+
+The 44.1k creates give the same numbers as 48k on the same file (same mode). Get Lucky's fitted gain is 0.975–0.995: the DRC limiter riding a hot master (F44.5); the others are within 0.6 % of 1. Waveform SNR is no quality score for a perceptual codec. It is the baseline the O6 flags get measured against (T6.1).
+
+**3. Spectrograms** (ffmpeg `showspectrumpic`, Nirvana SIDE-1 60–80 s, left channel; regenerate from the round-trip WAVs).
+- **Source:** music to ~21 kHz, then the master's noise floor up to 48 kHz.
+- **584k:** indistinguishable by eye, the >24 kHz floor included.
+- **152k:** a hard cut at ~16 kHz, the end-18 + top-band-cut path (F46.2).
+- **584k error signal** (decoded − source, 29.7 dB below the source, matching the measured SNR):
+  - it follows the music's spectrum ~30 dB down;
+  - it steps at band edges, near 15–16, 24 and 32 kHz;
+  - above ~32 kHz it sits at the source's own noise-floor level, so the top band is reproduced as energy, not waveform.
+
+  That last point is where T6.1 starts: in the 96k mode most of the error *power* above 24 kHz is the coded noise floor of the master, inaudible by construction.
+
+**Pitfall.** ffmpeg's `amix` with `weights=1 -1` adds the inputs, not subtracts. Use `amerge` and `pan=stereo|c0=c0-c2|c1=c1-c3` for a difference signal.

@@ -182,3 +182,84 @@ small verifiable steps.
 *Why:* qemu-hosted encoding at 9 ms frames and AX201 Wi-Fi/BT coexistence can both cause
 clicks or dropouts that sound like "artifacts". Both are cheap to measure. If either is the
 cause, native execution (O5) or a radio fix matters more than encoder internals.
+
+**D33 — Feed the encoder plain 24-bit (2^23): `SSCENC_INPUT_SHIFT` default 0, not 6.**
+Supersedes the 2^29 scaling in plan.md T2.3 / discrepancy #3. At 2^29 the blob's headroom
+stage rides the gain frame by frame, unsignalled, in steps up to 14.5 dB (F38.7). On the
+buds, Get Lucky 88.2k sounded terrible at 6 and clean at 0 (F39.1). Changed on 2026-10-26:
+`config/bin/ssc-switch` (installed to `~/.local/bin`), `~/src/ssc-capture/set_ssc.sh` and
+`abtest.sh` (`SHIFT=${2:-0}`), `config/systemd-user/.../sscenc.conf`, and the plugin patch
+default (`0u`). The installed plugin `.so` still has the compiled default 6, but the conf
+always sets the variable.
+*Why:* the user's A/B plus the measurement. The 2^29 value came from an SSCOnWindows
+comment, never from the phone. Basic mode (48k) may want an even lower level (F39.4); this
+decision does not settle it.
+
+**D34 — Basic mode feeds the encoder 16-bit (2^15); `SSCENC_INPUT_SHIFT` is relative to the mode.**
+Extends D33. The 48 kHz mode is linear only up to 2^15; at the 2^23 that D33 left it at, it
+rides the gain like UHQ at 2^29 (F40). The plugin patch now subtracts 8 from the shift when the
+encoder rate is not 96000 and rounds S24 to 16-bit. Shift 0 now means each mode's nominal level
+(UHQ 2^23, basic 2^15), so `ssc-switch`/`set_ssc.sh` need no change beyond help text.
+*Why:* measured on two tracks at seven levels, identical at create rate 44100 and 48000. The
+installed plugin `.so` is not rebuilt; basic mode stays hot until it is.
+
+**Note on D33/D34 (2026-10-26, F43):** where these say "headroom stage", read **DRC limiter**
+(`SSC_DRC_Exe`). The headroom functions are a fixed spectral EQ. Both decisions stand: the
+limiter threshold is on the 24-bit scale for UHQ and the 16-bit scale for basic with bits=34.
+
+**D35 — The native encoder reaches the plugin through the helper launcher; the blob stays the default.**
+Proposed in-session on 2026-10-26 (F47). In effect the same day: the user asked to "build native
+and change sscenc to tee", and the plugin has run `SSCENC_BACKEND=tee` since 18:23 (F47.5).
+Build-time table extraction (OD7) is what that build uses; the user hasn't commented on it
+separately.
+**Update (2026-10-26, ~18:28):** after tee showed 0 differing frames, the user switched the live
+backend to `native` and reported it sounds really good (F47.6). The launcher's default without
+the variable is still the blob.
+- `ssc-codec/native` builds `ssc_native_helper`, which speaks `ssc_blob_helper`'s protocol.
+  `config/bin/sscenc-blob-run` selects it by `SSCENC_BACKEND` (`blob` by default, `native`,
+  `tee`), so the plugin itself doesn't change.
+- Samsung's tables are extracted from the user's blob at build time into a gitignored header,
+  not parsed at runtime (OD7).
+- `harness/ssc_encoder.c` stays the one source for both the qemu harness and the native
+  build (OD24).
+
+*Why:* the native helper is bit-exact with the blob on every frame tested (F46, F47). The
+launcher already isolates the encoder in its own process, so swapping helpers changes
+nothing else in the pipeline. `tee` gives the live bit-exact check (T5.2) without changing
+what the buds receive. The blob stays the default until the T5.3 listening test (D6, volume
+10 % first).
+
+**D36 — Phase 4 codebase: libopus v1.1 plus a patch series, in `~/src/ssc-codec`.**
+Promoted on 2026-10-27 from OD2, OD3, OD5, OD6 and OD16, which were settled and in use during Phase 4.
+- The rebuild lives in its own repo, `~/src/ssc-codec`, not here (OD2).
+- libopus is pinned at tag `v1.1` (F29) as `third_party/opus`. Every Samsung delta is a numbered
+  patch in `harness/patches/`, 0001–0013 so far (OD3, OD16). The only new source is
+  `harness/ssc_encoder.c` (the `ssc_encode` top level, headroom and DRC; OD24, D35).
+- Static analysis uses Ghidra 12.2 headless at `~/.local/opt/ghidra` (OD5). Transcriptions are
+  checked against the disassembly, not the decompile (F43.2).
+- Vinchethescript's `encoder.c` is not used (OD6). Our own decompile plus the differential harness
+  replaced it.
+
+*Why:* a patch per delta keeps each Samsung change small, named and testable on its own. A
+patch's removal must fail its test (F31, F33), and stock v1.1 stays one `make STOCK=1` away.
+A separate repo keeps codec work out of the plugin/config repo, and no Samsung code or tables
+enter either one (D28).
+
+**D37 — Verification method: stock C first, the reference mode from the blob, transcribe only on mismatch.**
+Promoted on 2026-10-27 from OD13 and OD14.
+- Each blob function is first tested against stock v1.1 C on the encoder's real domain. Only a
+  mismatch leads to a patch, transcribed from the disassembly (OD14; comb_filter needed one, 0008).
+- Under qemu the harness builds its reference `CELTMode` at runtime from the blob's own
+  `ssc_custom_mode_create`, so the harness source carries no Samsung tables (OD13, F33). The
+  native build extracts them at build time instead (OD7, D35).
+
+*Why:* most of the blob is specialised stock code (F30, F48). Testing stock first finds the real
+deltas without transcribing code that is already open source.
+
+**D38 — Phase 4 ends at a byte-identical encoder; tuning (O6) is out of scope.**
+User decision, 2026-10-27: "document it as out of scope, we only needed byte-identical for today."
+The native encoder is byte-identical to Samsung's blob on every frame tested and is live (F46, F47).
+O6 (T6.1–T6.3), AC6 and the T3.4 per-band map that fed it are dropped. Any future tuning is a new
+phase, flag-gated with the byte-identical encoder as the default (D4, D30).
+*Why:* the phase's purpose for the user was reproducing Samsung's encoder exactly, and that is
+done. Tuning would by definition give up byte-identity with Samsung's output.

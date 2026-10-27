@@ -46,7 +46,7 @@ Status legend: [ ] todo, [~] in progress, [x] done, [-] dropped (with reason in 
 |---|--------|--------------------------|-----------|-----|--------|
 | 1 | Graph rate during UHQ | 96 kHz native (HAL offload) | 48 kHz → resampled to 96 kHz | Add 96000 to allowed-rates | config written, test pending |
 | 2 | RTP timestamp | +1 per packet (A31 capture) | +1 per packet (SSCENC_RTP_TS=frames) | already fixed | ✓ working |
-| 3 | PCM scaling | 2^29 full scale | 2^29 (shift=6 from S24_32) | already fixed | ✓ working |
+| 3 | PCM scaling | 2^29 full scale (unverified on the phone) | 2^29 (shift=6 from S24_32) | already fixed | ✗ wrong: 2^29 drives the DRC limiter (called "headroom" before F43) into gain riding (F38.7, F43); now 2^23, shift 0 by default (D33, F39.1) |
 | 4 | Frame size at UHQ | 864 (hardcoded, F10: 0x88b9a0) | 864 | matches | ✓ confirmed |
 | 5 | Frames per packet | 1 (F10: encode loop dispatches per frame) | 1 | matches | ✓ confirmed |
 | 6 | UHQ sub-bitrates | 584k / 291k / 152k (F11 table) | uhq-442 and uhq-250 = **wrong values** | Change to uhq-291 (291000) / uhq-152 (152000) | **root cause of silence found** |
