@@ -12,14 +12,14 @@ learning, from Samsung's own Bluetooth stack, exactly how a phone drives
 `libScalable_Encoder.so` and packetizes SSC, then reproducing that behaviour in our
 openssc-based PipeWire plugin.
 
-Phase 4 then rebuilt the encoder itself: `~/src/ssc-codec` is libopus v1.1 plus a patch
+Phase 4 then rebuilt the encoder itself: `ssc-codec` (a separate, private repo) is libopus v1.1 plus a patch
 series that reproduces `libScalable_Encoder.so` byte for byte, and it runs natively in the
 plugin instead of the blob under qemu.
 
 ## Current state (2026-10-27)
-- **Encoder**: the native rebuild (`SSCENC_BACKEND=native`, `~/src/ssc-codec`), bit-exact with Samsung's blob, no qemu (F46, F47). The blob under qemu is the fallback (`SSCENC_BACKEND=blob`).
+- **Encoder**: the native rebuild (`SSCENC_BACKEND=native`, `ssc-codec`), bit-exact with Samsung's blob, no qemu (F46, F47). The blob under qemu is the fallback (`SSCENC_BACKEND=blob`).
 - **Default profile**: UHQ-584 (584 kbps, 96 kHz codec, bits=34)
-- **SPA resample quality**: 14 (max — 1024-tap Kaiser filter, 0.993 cutoff, 155 dB stopband)
+- **SPA resample quality**: 10 (160 taps, cutoff 0.958, PipeWire 1.6.8's default exp window). 14 (1024 taps) sounded no different (D39)
 - **Quality**: every profile (uhq-584/291/152, basic-229) sounds clean at shift 0 from 44.1–96k sources, Wi-Fi on or off (F41). The old ranking was heard with the encoder input too hot (F38.7, F40) and is withdrawn.
 
 ### Graph modes
@@ -33,7 +33,7 @@ plugin instead of the blob under qemu.
 | **hires** | 48k+96k | SPA 44.1→48k + BT-sink 48→96k | passthrough + BT-sink 48→96k | SPA 88.2→96k (1.088:1) | passthrough |
 
 - **direct**: single-step SPA resample to 96k. Best for mixed-rate sources. Hits 44.1k with
-  the hard 2.177:1 ratio but q14's 1024-tap filter handles it well.
+  the hard 2.177:1 ratio; quality 10 handles it as well as 14 did to the ear (D39).
 - **normal**: double resample for 44.1k (two clean ratios). Best for 44.1k-only listening.
   Destroys 88.2k/96k content (downsamples to 48k then back up).
 - **hires**: PipeWire picks closest allowed rate. Best all-rounder — clean ratios for all
@@ -51,9 +51,9 @@ plugin instead of the blob under qemu.
 | `~/.config/systemd/user/wireplumber.service.d/sscenc.conf` | SSC codec env vars (profile, bits, encoder blob, RTP timestamps) |
 | `~/.config/systemd/user/wireplumber.service.d/spa-bluez5-fix.conf` | HFP mic fix (patched libspa-bluez5.so path) |
 | `~/.config/pipewire/pipewire.conf.d/50-ssc-uhq-rate.conf` | Graph allowed-rates (default: 48k locked) |
-| `~/.config/pipewire/pipewire.conf.d/51-resample-quality.conf` | SPA resample quality (14) |
-| `~/.config/pipewire/pipewire-pulse.conf.d/51-resample-quality.conf` | SPA resample quality for PulseAudio clients (14) |
-| `~/.config/pipewire/client.conf.d/51-resample-quality.conf` | SPA resample quality for native PW clients (14) |
+| `~/.config/pipewire/pipewire.conf.d/51-resample-quality.conf` | SPA resample quality (10) |
+| `~/.config/pipewire/pipewire-pulse.conf.d/51-resample-quality.conf` | SPA resample quality for PulseAudio clients (10) |
+| `~/.config/pipewire/client.conf.d/51-resample-quality.conf` | SPA resample quality for native PW clients (10) |
 | `~/.config/wireplumber/wireplumber.conf.d/52-buds-default-a2dp-ssc.conf` | Default to SSC on buds reconnect |
 | `~/.config/systemd/user/ssc-auto.service` | systemd user service for ssc-auto (disabled by default) |
 
@@ -76,23 +76,25 @@ systemctl --user daemon-reload && systemctl --user restart wireplumber
 The patched `.so` files in `~/.local/lib/spa-0.2-patched/bluez5/` must be rebuilt
 when PipeWire is updated. Two patches are needed:
 
-**1. HFP mic fix** (source: `~/src/pipewire-hfp-atbcc-fix`):
+**1. HFP mic fix** (source: your `pipewire-hfp-atbcc-fix` checkout, see below):
 ```sh
-cd ~/src/pipewire-hfp-atbcc-fix && ./build-and-install.sh
+cd pipewire-hfp-atbcc-fix && ./build-and-install.sh
 ```
 This builds `libspa-bluez5.so` with the eSCO patches and installs it to
 `~/.local/lib/spa-0.2-patched/bluez5/`. Upstream: pipewire#5506.
 
 **2. SSC codec plugin** (patch: `config/ssc-pipewire-1.6.8.patch`):
 ```sh
+# Run from the ssc-uhq checkout
+SSC_UHQ=$PWD
 # Clone PipeWire source matching your version
 VER=$(pipewire --version | awk '/Compiled with/{print $NF}')
-cd ~/.cache/openssc-build
+mkdir -p ~/.cache/openssc-build && cd ~/.cache/openssc-build
 git clone --depth 1 --branch $VER https://gitlab.freedesktop.org/pipewire/pipewire.git pipewire-$VER
 cd pipewire-$VER
 
 # Apply SSC patch (may need manual adjustment for new PipeWire versions)
-git apply ~/src/ssc-uhq/config/ssc-pipewire-1.6.8.patch
+git apply "$SSC_UHQ/config/ssc-pipewire-1.6.8.patch"
 
 # Build just the bluez5 plugin
 meson setup build '-Dsession-managers=[]' -Dexamples=disabled -Dtests=disabled
@@ -104,8 +106,8 @@ cp build/spa/plugins/bluez5/libspa-codec-bluez5-ssc.so \
 systemctl --user restart wireplumber
 ```
 
-**Dependencies**: `~/src/ssc-blob/s24u/libScalable_Encoder.so` (Samsung encoder,
-extracted from S24 Ultra firmware via samloader-rs), the native helper at
+**Dependencies**: your extracted `libScalable_Encoder.so` (Samsung encoder, e.g. from S24
+Ultra firmware via samloader-rs; its path goes in `SSCENC_BLOB_SO`), the native helper at
 `~/.local/libexec/sscenc/x86_64/` (its build extracts the tables from the blob), and openssc's
 blob helper at `~/.local/libexec/sscenc/aarch64/` for `SSCENC_BACKEND=blob` or `tee`.
 
@@ -134,6 +136,9 @@ blob helper at `~/.local/libexec/sscenc/aarch64/` for `SSCENC_BACKEND=blob` or `
 
 ## Building from scratch
 
+The commands below assume the repos (ssc-uhq, openssc, pipewire-hfp-atbcc-fix, ssc-codec) are
+cloned side by side in one working directory and run from there, unless a step says otherwise.
+
 ### Prerequisites
 
 ```sh
@@ -149,7 +154,7 @@ extract it from official firmware for a Samsung device you own.
 
 **Option A — via adb from your phone** (easiest, any Galaxy with SSC support):
 ```sh
-adb pull /system/lib64/libScalable_Encoder.so ~/src/ssc-blob/libScalable_Encoder.so
+adb pull /system/lib64/libScalable_Encoder.so libScalable_Encoder.so
 ```
 
 **Option B — from official firmware** (for S24 Ultra / S26 Ultra encoder with UHQ support):
@@ -159,7 +164,7 @@ samloader download -m SM-S928B -r EUX -o firmware.zip
 
 # Extract super.img from AP tar, then the system partition
 # (extract_super_partition.py or lpunpack + dump.erofs)
-dump.erofs --cat system/lib64/libScalable_Encoder.so > ~/src/ssc-blob/s24u/libScalable_Encoder.so
+dump.erofs --cat system/lib64/libScalable_Encoder.so > libScalable_Encoder.so
 ```
 
 **Known working encoders**:
@@ -170,7 +175,7 @@ dump.erofs --cat system/lib64/libScalable_Encoder.so > ~/src/ssc-blob/s24u/libSc
 
 The ARM64 encoder runs under qemu-aarch64 via a helper binary:
 ```sh
-cd ~/src/openssc  # github.com/sachk/openssc
+git clone https://github.com/sachk/openssc && cd openssc
 # Build the blob helper and shim libraries
 make -C sscenc/blob CROSS=aarch64-linux-gnu-
 mkdir -p ~/.local/libexec/sscenc/aarch64 ~/.local/libexec/sscenc/shims
@@ -182,12 +187,13 @@ cp sscenc/blob/shims/*.so ~/.local/libexec/sscenc/shims/
 
 **1. HFP mic fix** (optional but recommended for Galaxy Buds):
 ```sh
-git clone https://github.com/abrus861/pipewire-hfp-atbcc-fix ~/src/pipewire-hfp-atbcc-fix
-cd ~/src/pipewire-hfp-atbcc-fix && ./build-and-install.sh
+git clone https://github.com/abrus861/pipewire-hfp-atbcc-fix
+cd pipewire-hfp-atbcc-fix && ./build-and-install.sh
 ```
 
 **2. SSC codec plugin**:
 ```sh
+SSC_UHQ=$PWD/ssc-uhq
 VER=$(pipewire --version | awk '/Compiled with/{print $NF}')
 mkdir -p ~/.cache/openssc-build && cd ~/.cache/openssc-build
 git clone --depth 1 --branch $VER \
@@ -195,7 +201,7 @@ git clone --depth 1 --branch $VER \
 cd pipewire-$VER
 
 # Apply SSC patch
-git apply ~/src/ssc-uhq/config/ssc-pipewire-1.6.8.patch
+git apply "$SSC_UHQ/config/ssc-pipewire-1.6.8.patch"
 
 # Build
 meson setup build '-Dsession-managers=[]' -Dexamples=disabled -Dtests=disabled
@@ -208,16 +214,17 @@ cp build/spa/plugins/bluez5/libspa-codec-bluez5-ssc.so \
 
 ### Native encoder (recommended, Phase 4)
 
-`~/src/ssc-codec` rebuilds Samsung's encoder natively, byte-identical to the blob (F46, F47),
+`ssc-codec` (private repo) rebuilds Samsung's encoder natively, byte-identical to the blob (F46, F47),
 at ~2 % of a core. Its helper speaks the blob helper's protocol, so the launcher picks the
 backend from `SSCENC_BACKEND`: `native` (no qemu; what this setup runs), `blob` (the launcher's
 default when the variable is unset), or `tee` (both run, the blob's frames are sent, and
 mismatches go to the journal). The build still needs your blob: it extracts Samsung's tables
 from it into a gitignored header (D28, OD7).
 ```sh
-make -C ~/src/ssc-codec/native            # extracts the tables from your blob (BLOB=...)
+git -C ssc-codec submodule update --init      # libopus v1.1
+make -C ssc-codec/native BLOB=/path/to/libScalable_Encoder.so   # extracts the tables from your blob
 mkdir -p ~/.local/libexec/sscenc/x86_64
-cp ~/src/ssc-codec/native/build/ssc_native_helper ~/.local/libexec/sscenc/x86_64/
+cp ssc-codec/native/build/ssc_native_helper ~/.local/libexec/sscenc/x86_64/
 # then add Environment=SSCENC_BACKEND=native (or tee) to sscenc.conf and restart wireplumber
 ```
 `native/build/ssc_native_roundtrip` (encode, decode, SNR, WAV) and `ssc_native_decode`
@@ -226,7 +233,7 @@ cp ~/src/ssc-codec/native/build/ssc_native_helper ~/.local/libexec/sscenc/x86_64
 ### Installing configs and scripts
 
 ```sh
-cd ~/src/ssc-uhq
+cd ssc-uhq
 
 # Configs
 mkdir -p ~/.config/systemd/user/wireplumber.service.d \
@@ -273,6 +280,6 @@ S948BXXS3AZF4 (official Samsung FUS download).
 - `plan-phase2.md` — Phase 2 quality tuning (mostly complete, T5.2 adaptive bitrate remaining)
 - `plan-phase3.md` — Phase 3 AVDTP timing (closed — moot per D21/F20)
 - `plan-phase4.md` — Phase 4 native codec rebuild on a libopus CELT base (done in scope, D38: the goal was a byte-identical encoder; tuning (O6) is out of scope). The buds now play the native encoder (`SSCENC_BACKEND=native`, no qemu): bit-exact with Samsung's blob on every frame tested, ~2 % of a core, and the user says it sounds really good (F46, F47). The decoder ends every frame with the encoder's energies (patch 0013). The original artifact was the input level driving Samsung's DRC limiter (F43), fixed by D33/D34.
-- `decisions.md` — decision log (D1–D38)
+- `decisions.md` — decision log (D1–D39)
 - `findings.md` — evidence-backed results with addresses and parameters (F1–F50; F48 is the full function classification)
 - `tools/` — analysis scripts (`helper_timing.py`: qemu encode timing, F42; `drc_count.py`: limiter engagement, F43)

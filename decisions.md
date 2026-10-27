@@ -263,3 +263,10 @@ O6 (T6.1–T6.3), AC6 and the T3.4 per-band map that fed it are dropped. Any fut
 phase, flag-gated with the byte-identical encoder as the default (D4, D30).
 *Why:* the phase's purpose for the user was reproducing Samsung's encoder exactly, and that is
 done. Tuning would by definition give up byte-identity with Samsung's output.
+
+**D39 — SPA resample quality 10, not 14.** User decision, 2026-10-27: quality 14 "doesn't make
+any difference in quality". All three config paths (daemon, PulseAudio clients, native clients)
+go back to `resample.quality = 10`, the value D12 first chose. With PipeWire 1.6.8's default exp
+window that is 160 taps at cutoff 0.958, against 1024 taps at 0.990 for 14. (The README's old
+"1024-tap Kaiser, 155 dB" described the Kaiser window, which this setup never selected.)
+*Why:* there was no audible gain, and 14 costs about 6× the filter taps per resampled stream.

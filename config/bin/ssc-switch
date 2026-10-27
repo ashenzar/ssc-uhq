@@ -91,7 +91,7 @@ case "${1:-status}" in
     direct)
         pw-metadata -n settings 0 clock.allowed-rates '[ 96000 ]' >/dev/null 2>&1
         pw-metadata -n settings 0 clock.force-rate '96000' >/dev/null 2>&1
-        echo "  graph: locked at 96k (single-step SPA resample, quality=14)"
+        echo "  graph: locked at 96k (single-step SPA resample, quality=10)"
         echo "  44.1→96k (2.177:1) and 48→96k (2:1) via SPA directly"
         echo "  run 'ssc-switch normal' to restore double-resample path"
         ;;
