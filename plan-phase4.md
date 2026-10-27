@@ -249,6 +249,39 @@ After any change to `harness/ssc_encoder.c` or the patches:
 Phase 4's in-scope work is done (D38). Nothing is queued. If tuning comes back, it is a new
 phase that starts from the out-of-scope note above.
 
+**State at the end of 2026-10-27.**
+- Commits: ssc-codec b0af999 and ssc-uhq dffe4aa (`main`, no remotes, nothing pushed).
+- Uncommitted in ssc-uhq, made after dffe4aa: the README build commands made relative (no
+  `~/src`), resample quality 14 → 10 in the three `config/*/51-resample-quality.conf` and the
+  `ssc-switch` status text, and D39.
+- Live: the same quality-10 edit is in `~/.config/pipewire/*/51-resample-quality.conf` and
+  `~/.local/bin/ssc-switch`. **It is not active yet.** PipeWire has run since 2026-10-26 18:29, so
+  it needs `systemctl --user restart pipewire pipewire-pulse wireplumber` (the buds reconnect).
+- The HFP mic fix is installed and live, checked 2026-10-27: WirePlumber maps the patched
+  `~/.local/lib/spa-0.2-patched/bluez5/libspa-bluez5.so`, which contains the patch's "RFCOMM
+  codec unchanged" string. The stock one doesn't.
+
+**Portability: what has to change before someone else can rebuild this** (from reading the code
+on 2026-10-27; none of it is fixed yet). The README's commands are already relative. These live
+in the files themselves:
+
+| # | Where | Machine-specific | Change needed |
+|---|---|---|---|
+| P1 | `config/ssc-pipewire-1.6.8.patch` line 716 (meson) | `-DSSCENC_BLOB_HELPER="/home/asael/.local/libexec/sscenc/sscenc-blob-run"` is compiled into the plugin | Make it a meson option, or have the plugin read `$SSCENC_BLOB_HELPER` with `$HOME/.local/libexec/sscenc/sscenc-blob-run` as the fallback. The plugin must then be rebuilt (the 256k/328k fix, F47.4, would ship in the same rebuild). |
+| P2 | `config/bin/sscenc-blob-run` (last two lines) | qemu's `LD_LIBRARY_PATH=/home/asael/.local/libexec/sscenc/shims` and `/home/asael/.local/libexec/sscenc/aarch64/ssc_blob_helper` | `$HOME/...`, as the native branch already does. Copy it to `~/.local/libexec/sscenc/` afterwards. |
+| P3 | `config/systemd-user/wireplumber.service.d/spa-bluez5-fix.conf` | `SPA_PLUGIN_DIR=/home/asael/.local/lib/spa-0.2-patched:...` | systemd's `%h`: `SPA_PLUGIN_DIR=%h/.local/lib/spa-0.2-patched:/usr/lib/spa-0.2` |
+| P4 | `config/systemd-user/wireplumber.service.d/sscenc.conf` | `SSCENC_BLOB_SO=/home/asael/src/ssc-blob/s24u/...` | `%h/...`, or leave it: the README already says to set your own path |
+| P5 | `config/bin/ssc-switch` lines 21–22 and 76 | blob paths `$HOME/src/ssc-blob/{s24u/,}libScalable_Encoder.so`; it calls `~/src/ssc-capture/set_ssc.sh`, which is in no repo | Vendor `set_ssc.sh` into `config/bin/` (it rewrites sscenc.conf, restarts WirePlumber and reconnects the buds over D-Bus). Read the blob paths from variables or from sscenc.conf. |
+| P6 | `ssc-switch` line 20, `set_ssc.sh` (`DEV`, `CARD`), `config/wireplumber.conf.d/52-buds-default-a2dp-ssc.conf` | the buds' MAC `E8:C9:13:75:5F:AD` | One variable, e.g. `SSC_BUDS_MAC`, or detect the connected `bluez_card.*`. At minimum, document it in the README. |
+| P7 | ssc-codec `tools/ssc-extract-tables.py` (`KNOWN`) | it accepts only blob sha256 `90c4c1cb…4ce7` (S24U S928BXXU6EZIF; S26U AZF4 is byte-identical) | Document that exact build as required, which it effectively is: other builds have different mode addresses (F27, F47.1). Supporting one means finding its two static CELTMode addresses. |
+| P8 | ssc-codec `native/Makefile`, `harness/Makefile` (`BLOB ?= $(HOME)/src/ssc-blob/s24u/...`) and `tools/helper_compare.py` | default blob path | Fine as an overridable default (the README passes `BLOB=`); optionally error out when it is missing |
+| P9 | ssc-codec `harness/difftest.c` lines 2515, 2769 | `/home/asael/src/ssc-capture/uhq584_getlucky.frames`, a private capture | An env var (`DT_CAPTURE`) that skips the check when unset. It affects only the qemu harness, not the build. |
+| P10 | access | ssc-codec is private (D28); ssc-uhq alone can't build the native encoder | Grant access, or add it as a private submodule of ssc-uhq (discussed 2026-10-27, not done). Without it, others run the blob under qemu. |
+
+Order: P1–P3 make the plugin and launcher work for any user. P5 and P6 make the switching
+scripts work. The rest is documentation. After P1/P2, rebuild and reinstall as in the README, and
+re-check with `ssc-switch status` and a stream at volume 10 % (D6).
+
 Needs the user (optional): rebuild the plugin for the 256k/328k level fix when convenient (F47.4; only
 `SSCENC_PROFILE` basic-256/328 and friends). Say if build-time table extraction (OD7) should
 change. OD10 (corpus tracks) is still only proposed.

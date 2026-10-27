@@ -42,7 +42,7 @@ plugin instead of the blob under qemu.
 ### Hardware
 - ThinkPad (Intel AX201), Manjaro, PipeWire 1.6.8 with patched bluez5 plugin
   (HFP mic fix) + openssc SSC codec plugin
-- Galaxy Buds3 Pro (E8:C9:13:75:5F:AD), capability byte 0x3e
+- Galaxy Buds3 Pro, capability byte 0x3e
 - Encoder: native x86_64 helper since 2026-10-26 (tables extracted from the S24U blob at build time); fallback: Samsung S24U `libScalable_Encoder.so` via qemu-aarch64 + systemd-run
 
 ### Config files
@@ -138,6 +138,10 @@ blob helper at `~/.local/libexec/sscenc/aarch64/` for `SSCENC_BACKEND=blob` or `
 
 The commands below assume the repos (ssc-uhq, openssc, pipewire-hfp-atbcc-fix, ssc-codec) are
 cloned side by side in one working directory and run from there, unless a step says otherwise.
+
+**Not yet portable:** a few files still carry this machine's paths and the buds' MAC address
+(the plugin patch's launcher path, `sscenc-blob-run`, `spa-bluez5-fix.conf`, `ssc-switch`). The
+list and the fixes are in `plan-phase4.md`, "Portability" (P1–P10).
 
 ### Prerequisites
 
