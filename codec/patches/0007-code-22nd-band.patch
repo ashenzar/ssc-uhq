@@ -1,0 +1,18 @@
+--- a/celt/bands.c
++++ b/celt/bands.c
+@@ -1441,13 +1441,8 @@
+ 
+       tf_change = tf_res[i];
+       ctx.tf_change = tf_change;
+-      if (i>=m->effEBands)
+-      {
+-         X=norm;
+-         if (Y_!=NULL)
+-            Y = norm;
+-         lowband_scratch = NULL;
+-      }
++      /* SSC (F33): Samsung codes the 22nd band (i>=effEBands) from its real data.
++         Stock CELT points X and Y at the norm scratch buffer there. */
+       if (i==end-1)
+          lowband_scratch = NULL;
+ 

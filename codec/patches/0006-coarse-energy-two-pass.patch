@@ -1,0 +1,25 @@
+--- a/celt/quant_bands.c
++++ b/celt/quant_bands.c
+@@ -276,7 +276,10 @@
+ 
+    intra = force_intra || (!two_pass && *delayedIntra>2*C*(end-start) && nbAvailableBytes > (end-start)*C);
+    intra_bias = (opus_int32)((budget**delayedIntra*loss_rate)/(C*512));
+-   new_distortion = loss_distortion(eBands, oldEBands, start, effEnd, m->nbEBands, C);
++   /* SSC (F33): Samsung sums the distortion over C*effEnd contiguous entries. For
++      effEnd<nbEBands that takes all of channel 0 and drops the last channel-1 bands.
++      Same as stock for effEnd==nbEBands. */
++   new_distortion = loss_distortion(eBands, oldEBands, start, C*effEnd, C*effEnd, 1);
+ 
+    tell = ec_tell(enc);
+    if (tell+3 > budget)
+@@ -324,6 +327,10 @@
+       nintra_bytes = ec_range_bytes(&enc_intra_state);
+       intra_buf = ec_get_buffer(&enc_intra_state) + nstart_bytes;
+       save_bytes = nintra_bytes-nstart_bytes;
++      /* SSC (F33): Samsung saves the intra bits in a 150-byte stack buffer and drops
++         the intra option when they don't fit. */
++      if (save_bytes >= 150)
++         two_pass = 0;
+       if (save_bytes == 0)
+          save_bytes = ALLOC_NONE;
+       ALLOC(intra_bits, save_bytes, unsigned char);

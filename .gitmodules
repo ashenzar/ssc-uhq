@@ -1,0 +1,3 @@
+[submodule "codec/third_party/opus"]
+	path = codec/third_party/opus
+	url = https://gitlab.xiph.org/xiph/opus.git

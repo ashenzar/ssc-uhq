@@ -1,0 +1,67 @@
+diff -ru a/celt/celt_decoder.c b/celt/celt_decoder.c
+--- a/celt/celt_decoder.c
++++ b/celt/celt_decoder.c
+@@ -887,6 +887,24 @@
+       if (boost>0)
+          dynalloc_logp = IMAX(2, dynalloc_logp-1);
+    }
++   /* SSC (F46): the encoder carries a large boost in band 18, 19 or 20 over to the next
++      band when that band got none and its quantised energy is high. Nothing signals
++      it; both inputs are known here. Bands from end up have no offset. */
++   if (st->ssc_mode && nbEBands == 22)
++   {
++      for (i=st->end;i<nbEBands;i++)
++         offsets[i] = 0;
++      if (offsets[18] > 1000 && offsets[19] == 0) {
++         if (oldBandE[19] > 7000 || SHR16(oldBandE[18], 1) < oldBandE[19])
++            offsets[19] = offsets[18];
++      } else if (offsets[19] > 1000 && offsets[20] == 0) {
++         if (oldBandE[20] > 7000 || SHR16(oldBandE[19], 1) < oldBandE[20])
++            offsets[20] = offsets[19];
++      } else if (offsets[20] > 1000 && offsets[21] == 0) {
++         if (oldBandE[21] > 7000 || SHR16(oldBandE[20], 1) < oldBandE[21])
++            offsets[21] = offsets[20];
++      }
++   }
+ 
+    ALLOC(fine_quant, nbEBands, int);
+    alloc_trim = tell+(6<<BITRES) <= total_bits ?
+@@ -1021,7 +1039,8 @@
+       }
+       for (i=st->end;i<nbEBands;i++)
+       {
+-         oldBandE[c*nbEBands+i]=0;
++         /* SSC (F46): the encoder restarts dropped top bands from -28 dB, not 0. */
++         oldBandE[c*nbEBands+i]=st->ssc_mode ? -QCONST16(28.f,DB_SHIFT) : 0;
+          oldLogE[c*nbEBands+i]=oldLogE2[c*nbEBands+i]=-QCONST16(28.f,DB_SHIFT);
+       }
+    } while (++c<2);
+@@ -1206,6 +1225,15 @@
+          *value = st->ssc_tell;
+       }
+       break;
++      case CELT_GET_SSC_OLDBANDE_REQUEST:
++      {
++         opus_val16 **value = va_arg(ap, opus_val16 **);
++         if (value==NULL)
++            goto bad_arg;
++         *value = (opus_val16*)(st->_decode_mem+(DECODE_BUFFER_SIZE+st->overlap)*st->channels)
++               + st->channels*LPC_ORDER;
++      }
++      break;
+       case OPUS_GET_FINAL_RANGE_REQUEST:
+       {
+          opus_uint32 * value = va_arg(ap, opus_uint32 *);
+diff -ru a/celt/celt.h b/celt/celt.h
+--- a/celt/celt.h
++++ b/celt/celt.h
+@@ -120,6 +120,9 @@
+ #define CELT_SET_SSC_MODE(x) CELT_SET_SSC_MODE_REQUEST, __opus_check_int(x)
+ #define CELT_GET_SSC_TELL_REQUEST  10031
+ #define CELT_GET_SSC_TELL(x) CELT_GET_SSC_TELL_REQUEST, __opus_check_int_ptr(x)
++/* SSC: the decoder's oldBandE (2*nbEBands), to compare with the encoder's. */
++#define CELT_GET_SSC_OLDBANDE_REQUEST  10032
++#define CELT_GET_SSC_OLDBANDE(x) CELT_GET_SSC_OLDBANDE_REQUEST, (opus_val16 **)(x)
+ 
+ #define OPUS_SET_ENERGY_MASK_REQUEST    10026
+ #define OPUS_SET_ENERGY_MASK(x) OPUS_SET_ENERGY_MASK_REQUEST, __opus_check_val16_ptr(x)

@@ -1,0 +1,34 @@
+--- a/celt/pitch.c	2026-10-26 01:26:00.356766692 -0600
++++ b/celt/pitch.c	2026-10-26 01:26:00.366766746 -0600
+@@ -444,7 +444,8 @@
+          x2y2 = 1+HALF32(MULT32_32_Q31(xx,yy));
+          sh = celt_ilog2(x2y2)>>1;
+          t = VSHR32(x2y2, 2*(sh-7));
+-         g = g0 = VSHR32(MULT16_32_Q15(celt_rsqrt_norm(t), xy),sh+1);
++         /* SSC (F31): Samsung clamps the gain to Q15ONE; stock wraps in the int16 cast. */
++         g = g0 = EXTRACT16(MIN32(VSHR32(MULT16_32_Q15(celt_rsqrt_norm(t), xy),sh+1), Q15ONE));
+       }
+ #else
+       g = g0 = xy/celt_sqrt(1+xx*yy);
+@@ -472,15 +473,18 @@
+       }
+       dual_inner_prod(x, &x[-T1], &x[-T1b], N, &xy, &xy2);
+       xy += xy2;
+-      yy = yy_lookup[T1] + yy_lookup[T1b];
+ #ifdef FIXED_POINT
+       {
+          opus_val32 x2y2;
+          int sh, t;
+-         x2y2 = 1+MULT32_32_Q31(xx,yy);
++         /* SSC (F31): Samsung sums the two energies and forms xx*yy in 64 bits (stock
++            can overflow 32 bits near full scale), and clamps the gain like g0. */
++         opus_int64 yy64 = (opus_int64)yy_lookup[T1] + yy_lookup[T1b];
++         yy = (opus_val32)yy64;
++         x2y2 = 1+(opus_val32)(((opus_int64)xx*yy64)>>31);
+          sh = celt_ilog2(x2y2)>>1;
+          t = VSHR32(x2y2, 2*(sh-7));
+-         g1 = VSHR32(MULT16_32_Q15(celt_rsqrt_norm(t), xy),sh+1);
++         g1 = EXTRACT16(MIN32(VSHR32(MULT16_32_Q15(celt_rsqrt_norm(t), xy),sh+1), Q15ONE));
+       }
+ #else
+       g1 = xy/celt_sqrt(1+2.f*xx*1.f*yy);

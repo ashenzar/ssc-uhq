@@ -1,0 +1,13 @@
+--- a/celt/fixed_generic.h	2026-10-26 01:09:05.687467429 -0600
++++ b/celt/fixed_generic.h	2026-10-26 01:09:05.697467496 -0600
+@@ -46,7 +46,9 @@
+ #define MULT16_32_Q15(a,b) ADD32(SHL(MULT16_16((a),SHR((b),16)),1), SHR(MULT16_16SU((a),((b)&0x0000ffff)),15))
+ 
+ /** 32x32 multiplication, followed by a 31-bit shift right. Results fits in 32 bits */
+-#define MULT32_32_Q31(a,b) ADD32(ADD32(SHL(MULT16_16(SHR((a),16),SHR((b),16)),1), SHR(MULT16_16SU(SHR((a),16),((b)&0x0000ffff)),15)), SHR(MULT16_16SU(SHR((b),16),((a)&0x0000ffff)),15))
++/* SSC (F31): Samsung's build uses an exact 64-bit product here, not libopus 1.1's
++   16-bit partial-product approximation (which drops the low*low term). */
++#define MULT32_32_Q31(a,b) ((opus_val32)(((opus_int64)(a)*(opus_int64)(b))>>31))
+ 
+ /** Compile-time conversion of float constant to 16-bit value */
+ #define QCONST16(x,bits) ((opus_val16)(.5+(x)*(((opus_val32)1)<<(bits))))

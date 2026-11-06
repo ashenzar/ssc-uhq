@@ -1,0 +1,13 @@
+--- a/celt/mfrngcod.h	2026-10-26 01:12:20.922058217 -0600
++++ b/celt/mfrngcod.h	2026-10-26 01:12:20.928724925 -0600
+@@ -34,7 +34,9 @@
+ /*The number of bits to output at a time.*/
+ # define EC_SYM_BITS   (8)
+ /*The total number of bits in each of the state registers.*/
+-# define EC_CODE_BITS  (32)
++/*SSC (F31): Samsung's range coder keeps 24 bits of state, not 32
++   (normalises while rng<=2^15, carries out val>>15, masks val to 23 bits).*/
++# define EC_CODE_BITS  (24)
+ /*The maximum symbol value.*/
+ # define EC_SYM_MAX    ((1U<<EC_SYM_BITS)-1)
+ /*Bits to shift by to move a symbol into the high-order position.*/

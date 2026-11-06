@@ -1,0 +1,68 @@
+diff -ru a/celt/vq.c b/celt/vq.c
+--- a/celt/vq.c
++++ b/celt/vq.c
+@@ -151,15 +151,25 @@
+    return collapse_mask;
+ }
+ 
++/* SSC (T4.8): Samsung's alg_quant keeps iy, y and signx in .bss buffers (0x24dac,
++   0x24fec, 0x2522c) that lie inside ssc_encode's in[] (0x2402c). What the last large
++   call leaves in y[126..127] is in[1071], which the next frame's tone_detect reads as
++   its stale xcorr[244] (F45.2). When set, alg_quant works in that memory: iy at +0,
++   y at +0x240, signx at +0x480. */
++unsigned char *ssc_vq_scratch;
++
+ unsigned alg_quant(celt_norm *X, int N, int K, int spread, int B, ec_enc *enc
+ #ifdef RESYNTH
+    , opus_val16 gain
+ #endif
+    )
+ {
+-   VARDECL(celt_norm, y);
+-   VARDECL(int, iy);
+-   VARDECL(opus_val16, signx);
++   celt_norm *y;
++   int *iy;
++   opus_val16 *signx;
++   VARDECL(celt_norm, _y);
++   VARDECL(int, _iy);
++   VARDECL(opus_val16, _signx);
+    int i, j;
+    opus_val16 s;
+    int pulsesLeft;
+@@ -172,9 +182,19 @@
+    celt_assert2(K>0, "alg_quant() needs at least one pulse");
+    celt_assert2(N>1, "alg_quant() needs at least two dimensions");
+ 
+-   ALLOC(y, N, celt_norm);
+-   ALLOC(iy, N, int);
+-   ALLOC(signx, N, opus_val16);
++   ALLOC(_y, N, celt_norm);
++   ALLOC(_iy, N, int);
++   ALLOC(_signx, N, opus_val16);
++   if (ssc_vq_scratch)
++   {
++      iy = (int *)ssc_vq_scratch;
++      y = (celt_norm *)(ssc_vq_scratch + 0x240);
++      signx = (opus_val16 *)(ssc_vq_scratch + 0x480);
++   } else {
++      y = _y;
++      iy = _iy;
++      signx = _signx;
++   }
+ 
+    exp_rotation(X, N, 1, B, K, spread);
+ 
+diff -ru a/celt/vq.h b/celt/vq.h
+--- a/celt/vq.h
++++ b/celt/vq.h
+@@ -46,6 +46,9 @@
+  * @param enc Entropy encoder state
+  * @ret A mask indicating which blocks in the band received pulses
+ */
++/* SSC: alg_quant's scratch, when set (see vq.c). */
++extern unsigned char *ssc_vq_scratch;
++
+ unsigned alg_quant(celt_norm *X, int N, int K, int spread, int B,
+       ec_enc *enc
+ #ifdef RESYNTH

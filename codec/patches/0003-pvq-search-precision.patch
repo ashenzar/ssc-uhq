@@ -1,0 +1,30 @@
+--- a/celt/vq.c	2026-10-26 01:20:31.841614213 -0600
++++ b/celt/vq.c	2026-10-26 01:20:31.851614269 -0600
+@@ -275,6 +275,19 @@
+ 
+          /* Approximate score: we maximise Rxy/sqrt(Ryy) (we're guaranteed that
+             Rxy is positive because the sign is pre-computed) */
++#ifdef FIXED_POINT
++         /* SSC (F31): Samsung keeps 8 more bits of Rxy^2 (Q7 instead of Q15, as a
++            32-bit value) and compares the cross products in 64 bits. */
++         {
++            opus_val32 Rxy2 = SHR32(MULT16_16(Rxy,Rxy), 7);
++            if ((opus_int64)best_den*Rxy2 > (opus_int64)Ryy*best_num)
++            {
++               best_den = Ryy;
++               best_num = Rxy2;
++               best_id = j;
++            }
++         }
++#else
+          Rxy = MULT16_16_Q15(Rxy,Rxy);
+          /* The idea is to check for num/den >= best_num/best_den, but that way
+             we can do it without any division */
+@@ -285,6 +298,7 @@
+             best_num = Rxy;
+             best_id = j;
+          }
++#endif
+       } while (++j<N);
+ 
+       /* Updating the sums of the new pulse(s) */

@@ -1,0 +1,127 @@
+--- a/celt/celt.h
++++ b/celt/celt.h
+@@ -113,6 +113,14 @@
+ #define OPUS_SET_LFE_REQUEST    10024
+ #define OPUS_SET_LFE(x) OPUS_SET_LFE_REQUEST, __opus_check_int(x)
+ 
++/* SSC: 0 = stock CELT (tapset bit + tf).
++   1 = F-mode: no tapset bit, stock tf_decode (48 kHz frames do write TF).
++   2 = E-mode: no tapset bit and no TF bits (96 kHz frames go coarse → spread). */
++#define CELT_SET_SSC_MODE_REQUEST  10030
++#define CELT_SET_SSC_MODE(x) CELT_SET_SSC_MODE_REQUEST, __opus_check_int(x)
++#define CELT_GET_SSC_TELL_REQUEST  10031
++#define CELT_GET_SSC_TELL(x) CELT_GET_SSC_TELL_REQUEST, __opus_check_int_ptr(x)
++
+ #define OPUS_SET_ENERGY_MASK_REQUEST    10026
+ #define OPUS_SET_ENERGY_MASK(x) OPUS_SET_ENERGY_MASK_REQUEST, __opus_check_val16_ptr(x)
+ 
+--- a/celt/celt_decoder.c
++++ b/celt/celt_decoder.c
+@@ -70,6 +70,8 @@
+    int downsample;
+    int start, end;
+    int signalling;
++   int ssc_mode; /* 0 stock, 1 F-mode (tf), 2 E-mode (no tf). */
++   int ssc_tell; /* ec_tell() at the end of the last decode. */
+    int arch;
+ 
+    /* Everything beyond this point gets cleared on a reset */
+@@ -266,6 +268,11 @@
+    int shift;
+    const int overlap = OVERLAP(mode);
+ 
++   /* SSC: a mode built without a window (the blob's encoder modes carry a Q31 window
++      outside the mode) has no synthesis; entropy decoding still runs. The harness gives
++      the decoder stock's Q15 window and v1.1 mdct lookup (F38). */
++   if (mode->window == NULL)
++      return;
+    if (shortBlocks)
+    {
+       B = shortBlocks;
+@@ -754,7 +761,8 @@
+    N = M*mode->shortMdctSize;
+ 
+    effEnd = st->end;
+-   if (effEnd > mode->effEBands)
++   /* SSC codes the 22nd band from real data (patch 0007), so it is denormalised too. */
++   if (effEnd > mode->effEBands && st->ssc_mode == 0)
+       effEnd = mode->effEBands;
+ 
+    if (data == NULL || len<=1)
+@@ -803,7 +811,8 @@
+          octave = ec_dec_uint(dec, 6);
+          postfilter_pitch = (16<<octave)+ec_dec_bits(dec, 4+octave)-1;
+          qg = ec_dec_bits(dec, 3);
+-         if (ec_tell(dec)+2<=total_bits)
++         /* SSC comb filter is tapset 0 only (F33, patch 0008); the bit is not in the stream. */
++         if (st->ssc_mode == 0 && ec_tell(dec)+2<=total_bits)
+             postfilter_tapset = ec_dec_icdf(dec, tapset_icdf, 2);
+          postfilter_gain = QCONST16(.09375f,15)*(qg+1);
+       }
+@@ -830,7 +839,12 @@
+          intra_ener, dec, C, LM);
+ 
+    ALLOC(tf_res, nbEBands, int);
+-   tf_decode(st->start, st->end, isTransient, tf_res, LM, dec);
++   if (st->ssc_mode == 2) {
++      /* E-mode writes no TF. Leaving tf_res at 0 matches the encoder. */
++      for (i=0;i<nbEBands;i++)
++         tf_res[i] = 0;
++   } else
++      tf_decode(st->start, st->end, isTransient, tf_res, LM, dec);
+ 
+    tell = ec_tell(dec);
+    spread_decision = SPREAD_NORMAL;
+@@ -956,13 +970,15 @@
+    c=0; do {
+       st->postfilter_period=IMAX(st->postfilter_period, COMBFILTER_MINPERIOD);
+       st->postfilter_period_old=IMAX(st->postfilter_period_old, COMBFILTER_MINPERIOD);
+-      comb_filter(out_syn[c], out_syn[c], st->postfilter_period_old, st->postfilter_period, mode->shortMdctSize,
+-            st->postfilter_gain_old, st->postfilter_gain, st->postfilter_tapset_old, st->postfilter_tapset,
+-            mode->window, overlap);
+-      if (LM!=0)
+-         comb_filter(out_syn[c]+mode->shortMdctSize, out_syn[c]+mode->shortMdctSize, st->postfilter_period, postfilter_pitch, N-mode->shortMdctSize,
+-               st->postfilter_gain, postfilter_gain, st->postfilter_tapset, postfilter_tapset,
++      if (mode->window) {
++         comb_filter(out_syn[c], out_syn[c], st->postfilter_period_old, st->postfilter_period, mode->shortMdctSize,
++               st->postfilter_gain_old, st->postfilter_gain, st->postfilter_tapset_old, st->postfilter_tapset,
+                mode->window, overlap);
++         if (LM!=0)
++            comb_filter(out_syn[c]+mode->shortMdctSize, out_syn[c]+mode->shortMdctSize, st->postfilter_period, postfilter_pitch, N-mode->shortMdctSize,
++                  st->postfilter_gain, postfilter_gain, st->postfilter_tapset, postfilter_tapset,
++                  mode->window, overlap);
++      }
+ 
+    } while (++c<CC);
+    st->postfilter_period_old = st->postfilter_period;
+@@ -1015,6 +1031,7 @@
+    deemphasis(out_syn, pcm, N, CC, st->downsample, mode->preemph, st->preemph_memD, freq);
+    st->loss_count = 0;
+    RESTORE_STACK;
++   st->ssc_tell = ec_tell(dec);
+    if (ec_tell(dec) > 8*len)
+       return OPUS_INTERNAL_ERROR;
+    if(ec_get_error(dec))
+@@ -1173,6 +1190,22 @@
+          st->signalling = value;
+       }
+       break;
++      case CELT_SET_SSC_MODE_REQUEST:
++      {
++         opus_int32 value = va_arg(ap, opus_int32);
++         if (value<0 || value>2)
++            goto bad_arg;
++         st->ssc_mode = value;
++      }
++      break;
++      case CELT_GET_SSC_TELL_REQUEST:
++      {
++         opus_int32 *value = va_arg(ap, opus_int32 *);
++         if (value==NULL)
++            goto bad_arg;
++         *value = st->ssc_tell;
++      }
++      break;
+       case OPUS_GET_FINAL_RANGE_REQUEST:
+       {
+          opus_uint32 * value = va_arg(ap, opus_uint32 *);

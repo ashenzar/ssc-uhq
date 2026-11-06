@@ -1,0 +1,45 @@
+--- a/celt/bands.c
++++ b/celt/bands.c
+@@ -456,8 +456,7 @@
+ 
+    N0 = M*m->shortMdctSize;
+ 
+-   if (M*(eBands[end]-eBands[end-1]) <= 8)
+-      return SPREAD_NONE;
++   /* SSC (F33): no early SPREAD_NONE return for a narrow last band. */
+    c=0; do {
+       for (i=0;i<end;i++)
+       {
+@@ -482,8 +481,9 @@
+          }
+ 
+          /* Only include four last bands (8 kHz and up) */
++         /* SSC (F33): weight 64, not 32 (Samsung counts in steps of 2). */
+          if (i>m->nbEBands-4)
+-            hf_sum += 32*(tcount[1]+tcount[0])/N;
++            hf_sum += 64*(tcount[1]+tcount[0])/N;
+          tmp = (2*tcount[2] >= N) + (2*tcount[1] >= N) + (2*tcount[0] >= N);
+          sum += tmp*256;
+          nbBands++;
+@@ -492,8 +492,8 @@
+ 
+    if (update_hf)
+    {
+-      if (hf_sum)
+-         hf_sum /= C*(4-m->nbEBands+end);
++      /* SSC (F33): fixed >>3 instead of /(C*(4-nbEBands+end)). */
++      hf_sum >>= 3;
+       *hf_average = (*hf_average+hf_sum)>>1;
+       hf_sum = *hf_average;
+       if (*tapset_decision==2)
+@@ -509,7 +509,9 @@
+    }
+    /*printf("%d %d %d\n", hf_sum, *hf_average, *tapset_decision);*/
+    celt_assert(nbBands>0); /* end has to be non-zero */
+-   sum /= nbBands;
++   /* SSC (F33): no division for nbBands<=1. */
++   if (nbBands>1)
++      sum /= nbBands;
+    /* Recursive averaging */
+    sum = (sum+*average)>>1;
+    *average = sum;

@@ -1,0 +1,5 @@
+# D28: nothing derived from Samsung's binary is committed. native/build/ssc_tables.h is
+# extracted from the user's own blob at build time (tools/ssc-extract-tables.py).
+/native/build/
+*.so
+__pycache__/

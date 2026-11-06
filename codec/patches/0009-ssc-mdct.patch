@@ -1,0 +1,386 @@
+diff -Nru a/celt/ssc_mdct.c b/celt/ssc_mdct.c
+--- a/celt/ssc_mdct.c
++++ b/celt/ssc_mdct.c
+@@ -0,0 +1,336 @@
++/* SSC (F33.8, F34): Samsung's forward MDCT and FFT, transcribed from the blob's
++   ssc_mdct_forward and ssc_fft (NEON). Same structure as libopus v1.1's
++   clt_mdct_forward()/opus_fft() (fold, pre-rotate, N/4 FFT, post-rotate; mixed-radix
++   decimation in time with 1/radix scaling per stage), but:
++   - Q31 window, trig and FFT twiddles, and every product sum is 64-bit, rounded once;
++   - the pre/post-rotations use an exact rotation by pi/(4N) instead of v1.1's
++     small-angle "sine" correction;
++   - the FFT is hard-wired to 432 = 3·3·3·4·4 and 54 = 3·3·3·2 (shifts 0 and 3), radix 3
++     innermost. Radix-3 butterflies skip the twiddle at k=0; radix-4 and radix-2 ones
++     multiply by twiddles[0] = 2^31-1 like any other.
++   The blob's second radix-3 stage runs one block of 9 past the end of the buffer (49
++   blocks for 432, 7 for 54). That only touches scratch and never feeds an output, so it
++   is not reproduced. */
++#ifdef HAVE_CONFIG_H
++#include "config.h"
++#endif
++
++#include <math.h>
++#include "ssc_mdct.h"
++#include "arch.h"
++#include "stack_alloc.h"
++
++#define THIRD    ((opus_int32)0x2aaaaaab)   /* 1/3 in Q31 */
++#define MSIN60   ((opus_int32)0x9126145f)   /* -sin(pi/3) in Q31 */
++
++/* Two's-complement wrapping 32-bit arithmetic, as the NEON lanes do. */
++static OPUS_INLINE opus_int32 wadd(opus_int32 a, opus_int32 b) { return (opus_int32)((opus_uint32)a + (opus_uint32)b); }
++static OPUS_INLINE opus_int32 wsub(opus_int32 a, opus_int32 b) { return (opus_int32)((opus_uint32)a - (opus_uint32)b); }
++static OPUS_INLINE opus_int32 wneg(opus_int32 a) { return (opus_int32)(0u - (opus_uint32)a); }
++
++/* 32x32->64 product; sums wrap modulo 2^64 (smull/smlal). */
++static OPUS_INLINE opus_uint64 P(opus_int32 a, opus_int32 b) { return (opus_uint64)((opus_int64)a * b); }
++
++/* rshrn #31: (x + 2^30) >> 31, low 32 bits. */
++static OPUS_INLINE opus_int32 R31(opus_uint64 x) { return (opus_int32)(opus_uint32)((x + (1u << 30)) >> 31); }
++
++/* Radix-4 twiddle product, already divided by 4: sqadd 2^32, sshr #33, xtn. */
++static OPUS_INLINE opus_int32 R33(opus_uint64 x)
++{
++   opus_int64 s = (opus_int64)x;
++   s = s > (opus_int64)0x7fffffffffffffffLL - ((opus_int64)1 << 32) ? (opus_int64)0x7fffffffffffffffLL : s + ((opus_int64)1 << 32);
++   return (opus_int32)(opus_uint32)(opus_uint64)(s >> 33);
++}
++
++/* srshr #1 on a 32-bit lane. */
++static OPUS_INLINE opus_int32 RH(opus_int32 x) { return (opus_int32)(((opus_int64)x + 1) >> 1); }
++
++/* Complex product a*w, one 64-bit sum per part. */
++#define CMUL_R(ar, ai, w) (P(wneg(ai), (w)[1]) + P((ar), (w)[0]))
++#define CMUL_I(ar, ai, w) (P((ar), (w)[1]) + P((ai), (w)[0]))
++
++/* ---- tables (OD17: all formula-generated) --------------------------------------- */
++
++static opus_int32 q31(double v)
++{
++   v = floor(.5 + 2147483648. * v);
++   /* Q31 cannot hold -1; the blob stores -2147483647, same as libopus. */
++   return (opus_int32)(v > 2147483647. ? 2147483647. : v < -2147483647. ? -2147483647. : v);
++}
++
++static opus_int32 twiddles[SSC_FFT_N * 2];
++static opus_int16 bitrev432[SSC_FFT_N / 3], bitrev54[54 / 3];
++static opus_int32 trig[SSC_MDCT_N / 4 + 1];
++static opus_int32 window[256];
++static int window_n;
++static ssc_kfft_state kfft432 = {SSC_FFT_N / 3, 0, bitrev432, twiddles};
++static ssc_kfft_state kfft54 = {54 / 3, 3, bitrev54, twiddles};
++static ssc_mdct_lookup lookup = {SSC_MDCT_N, 3, {&kfft432, &kfft54}, trig};
++
++/* libopus' compute_bitrev_table(), on a factor list given outermost first. */
++static void bitrev_rec(int Fout, opus_int16 *f, int fstride, const int *factors)
++{
++   int p = factors[0], m = factors[1], j;
++   for (j = 0; j < p; j++)
++   {
++      if (m == 1)
++         *f = Fout + j;
++      else
++      {
++         bitrev_rec(Fout, f, fstride * p, factors + 2);
++         Fout += m;
++      }
++      f += fstride;
++   }
++}
++
++static void build_bitrev(opus_int16 *out, int n, const int *factors)
++{
++   opus_int16 f[SSC_FFT_N];
++   int k;
++   bitrev_rec(0, f, 1, factors);
++   for (k = 0; k < n / 3; k++)
++      out[k] = 2 * f[k];
++}
++
++const ssc_mdct_lookup *ssc_mdct_init(void)
++{
++   static const int f432[] = {4, 108, 4, 27, 3, 9, 3, 3, 3, 1};
++   static const int f54[] = {2, 27, 3, 9, 3, 3, 3, 1};
++   static int done;
++   int k;
++   if (done)
++      return &lookup;
++   for (k = 0; k < SSC_FFT_N; k++)
++   {
++      double ph = -2 * M_PI * k / SSC_FFT_N;
++      twiddles[2 * k] = q31(cos(ph));
++      twiddles[2 * k + 1] = q31(sin(ph));
++   }
++   build_bitrev(bitrev432, 432, f432);
++   build_bitrev(bitrev54, 54, f54);
++   for (k = 0; k <= SSC_MDCT_N / 4; k++)
++      trig[k] = q31(cos(2 * M_PI * k / SSC_MDCT_N));
++   done = 1;
++   return &lookup;
++}
++
++const opus_int32 *ssc_mdct_window(int overlap)
++{
++   int i;
++   if (window_n != overlap)
++   {
++      for (i = 0; i < overlap; i++)
++      {
++         double s = sin(.5 * M_PI * (i + .5) / overlap);
++         window[i] = q31(sin(.5 * M_PI * s * s));
++      }
++      window_n = overlap;
++   }
++   return window;
++}
++
++/* ---- FFT -------------------------------------------------------------------------- */
++
++/* Radix-3 butterflies at Fout[k], Fout[k+m], Fout[k+2m] for every k < m of nblk blocks.
++   fs is the twiddle stride in units of the shared 432-point table. */
++static void bfly3(opus_int32 *F, int m, int fs, int nblk, const opus_int32 *tw)
++{
++   int b, k;
++   for (b = 0; b < nblk; b++)
++      for (k = 0; k < m; k++)
++      {
++         opus_int32 *f0 = F + 2 * (b * 3 * m + k), *f1 = f0 + 2 * m, *f2 = f1 + 2 * m;
++         opus_int32 s1r = R31(P(f1[0], THIRD)), s1i = R31(P(f1[1], THIRD));
++         opus_int32 s2r = R31(P(f2[0], THIRD)), s2i = R31(P(f2[1], THIRD));
++         opus_int32 a0r, a0i, sr, si, tr, ti, xr, xi;
++         if (k)
++         {
++            const opus_int32 *w1 = tw + 2 * fs * k, *w2 = tw + 4 * fs * k;
++            opus_int32 r = R31(CMUL_R(s1r, s1i, w1)), i = R31(CMUL_I(s1r, s1i, w1));
++            s1r = r; s1i = i;
++            r = R31(CMUL_R(s2r, s2i, w2)); i = R31(CMUL_I(s2r, s2i, w2));
++            s2r = r; s2i = i;
++         }
++         sr = wadd(s1r, s2r);
++         si = wadd(s1i, s2i);
++         tr = R31(P(wsub(s1r, s2r), MSIN60));
++         ti = R31(P(wsub(s1i, s2i), MSIN60));
++         a0r = R31(P(f0[0], THIRD));
++         a0i = R31(P(f0[1], THIRD));
++         xr = wsub(a0r, sr >> 1);
++         xi = wsub(a0i, si >> 1);
++         f0[0] = wadd(sr, a0r);
++         f0[1] = wadd(si, a0i);
++         /* u = (t.i, -t.r) */
++         f1[0] = wsub(xr, ti);
++         f1[1] = wsub(xi, wneg(tr));
++         f2[0] = wadd(ti, xr);
++         f2[1] = wadd(wneg(tr), xi);
++      }
++}
++
++static void bfly4(opus_int32 *F, int m, int fs, int nblk, const opus_int32 *tw)
++{
++   int b, j;
++   for (b = 0; b < nblk; b++)
++      for (j = 0; j < m; j++)
++      {
++         opus_int32 *f0 = F + 2 * (b * 4 * m + j), *f1 = f0 + 2 * m, *f2 = f1 + 2 * m, *f3 = f2 + 2 * m;
++         const opus_int32 *w1 = tw + 2 * fs * j, *w2 = tw + 4 * fs * j, *w3 = tw + 6 * fs * j;
++         opus_int32 s0r = R33(CMUL_R(f1[0], f1[1], w1)), s0i = R33(CMUL_I(f1[0], f1[1], w1));
++         opus_int32 s2r = R33(CMUL_R(f3[0], f3[1], w3)), s2i = R33(CMUL_I(f3[0], f3[1], w3));
++         opus_int32 s1r = R33(CMUL_R(f2[0], f2[1], w2)), s1i = R33(CMUL_I(f2[0], f2[1], w2));
++         opus_int32 ar = wadd(f0[0], 2) >> 2, ai = wadd(f0[1], 2) >> 2;
++         opus_int32 s5r = wsub(ar, s1r), s5i = wsub(ai, s1i);
++         opus_int32 br = wadd(s1r, ar), bi = wadd(s1i, ai);
++         opus_int32 s3r = wadd(s0r, s2r), s3i = wadd(s0i, s2i);
++         opus_int32 s4r = wsub(s0r, s2r), s4i = wsub(s0i, s2i);
++         /* u = (s4.i, -s4.r) */
++         f0[0] = wadd(s3r, br);
++         f0[1] = wadd(s3i, bi);
++         f2[0] = wsub(br, s3r);
++         f2[1] = wsub(bi, s3i);
++         f1[0] = wadd(s4i, s5r);
++         f1[1] = wadd(wneg(s4r), s5i);
++         f3[0] = wsub(s5r, s4i);
++         f3[1] = wsub(s5i, wneg(s4r));
++      }
++}
++
++static void bfly2(opus_int32 *F, int m, int fs, const opus_int32 *tw)
++{
++   int j;
++   for (j = 0; j < m; j++)
++   {
++      opus_int32 *f0 = F + 2 * j, *f1 = f0 + 2 * m;
++      const opus_int32 *w = tw + 2 * fs * j;
++      opus_int32 tr = R31(CMUL_R(f1[0], f1[1], w)), ti = R31(CMUL_I(f1[0], f1[1], w));
++      opus_int32 ar = f0[0], ai = f0[1];
++      f1[0] = RH(wsub(ar, tr));
++      f1[1] = RH(wsub(ai, ti));
++      f0[0] = RH(wadd(tr, ar));
++      f0[1] = RH(wadd(ti, ai));
++   }
++}
++
++void ssc_fft(const ssc_kfft_state *st, const opus_int32 *fin, opus_int32 *fout)
++{
++   int k, n3 = st->n3;
++   const opus_int32 *tw = st->twiddles;
++   for (k = 0; k < n3; k++)
++   {
++      /* bitrev[] is already an int32 index (2 * complex index), as stored in the blob. */
++      opus_int32 *o = fout + st->bitrev[k];
++      o[0] = fin[2 * k];
++      o[1] = fin[2 * k + 1];
++      o[2] = fin[2 * (k + n3)];
++      o[3] = fin[2 * (k + n3) + 1];
++      o[4] = fin[2 * (k + 2 * n3)];
++      o[5] = fin[2 * (k + 2 * n3) + 1];
++   }
++   bfly3(fout, 1, 0, n3, tw);
++   bfly3(fout, 3, 48, n3 / 3, tw);
++   bfly3(fout, 9, 16, n3 / 9, tw);
++   if (!st->small)
++   {
++      bfly4(fout, 27, 4, 4, tw);
++      bfly4(fout, 108, 1, 1, tw);
++   } else
++      bfly2(fout, 27, 8, tw);
++}
++
++/* ---- MDCT ------------------------------------------------------------------------- */
++
++void ssc_mdct_forward(const ssc_mdct_lookup *l, const opus_int32 *in, opus_int32 *out,
++      int overlap, int shift, int stride)
++{
++   int i, N, N2, N4, lim;
++   opus_int32 rc, rs;
++   const opus_int32 *t = l->trig, *wp1, *wp2;
++   const opus_int32 *xp1, *xp2;
++   opus_int32 *yp;
++   const opus_int32 *win = ssc_mdct_window(overlap);
++   VARDECL(opus_int32, f);
++   VARDECL(opus_int32, f2);
++   SAVE_STACK;
++   N = l->n >> shift;
++   N2 = N >> 1;
++   N4 = N >> 2;
++   ALLOC(f, N2, opus_int32);
++   ALLOC(f2, N2, opus_int32);
++   /* Exact rotation by pi/(4N) (only shifts 0 and 3 exist). */
++   rc = shift ? (opus_int32)0x7fffc88c : (opus_int32)0x7fffff22;
++   rs = shift ? (opus_int32)0x007725c6 : (opus_int32)0x000ee4bb;
++
++   /* Window, shuffle, fold */
++   xp1 = in + (overlap >> 1);
++   xp2 = in + N2 - 1 + (overlap >> 1);
++   yp = f;
++   wp1 = win + (overlap >> 1);
++   wp2 = win + (overlap >> 1) - 1;
++   lim = (overlap + 3) >> 2;
++   i = 0;
++   if (overlap >= 1)
++   {
++      int cnt = lim < 1 ? 1 : lim;
++      for (; i < cnt; i++)
++      {
++         *yp++ = R31(P(*wp1, *xp2) + P(*wp2, xp1[N2]));
++         *yp++ = R31(P(*xp1, *wp1) - P(xp2[-N2], *wp2));
++         xp1 += 2;
++         xp2 -= 2;
++         wp1 += 2;
++         wp2 -= 2;
++      }
++   }
++   wp1 = win;
++   wp2 = win + overlap - 1;
++   for (; i < N4 - lim; i++)
++   {
++      *yp++ = *xp2;
++      *yp++ = *xp1;
++      xp1 += 2;
++      xp2 -= 2;
++   }
++   for (; i < N4; i++)
++   {
++      *yp++ = R31(P(*wp2, *xp2) - P(*wp1, xp1[-N2]));
++      *yp++ = R31(P(xp2[N2], *wp1) + P(*xp1, *wp2));
++      xp1 += 2;
++      xp2 -= 2;
++      wp1 += 2;
++      wp2 -= 2;
++   }
++
++   /* Pre-rotation */
++   for (i = 0; i < N4; i++)
++   {
++      opus_int32 re = f[2 * i], im = f[2 * i + 1];
++      opus_int32 t1 = t[i << shift], t2 = t[(N4 - i) << shift];
++      opus_int32 a = R31(P(im, t2) + P(re, t1));
++      opus_int32 b = R31(P(re, t2) + P(wneg(im), t1));
++      f[2 * i] = R31(P(b, rs) + P(wneg(a), rc));
++      f[2 * i + 1] = R31(P(a, rs) + P(b, rc));
++   }
++
++   /* N/4 complex FFT, down-scales by 4/N */
++   ssc_fft(l->kfft[shift >> 1], f, f2);
++
++   /* Post-rotate */
++   {
++      opus_int32 *yp1 = out, *yp2 = out + stride * (N2 - 1);
++      for (i = 0; i < N4; i++)
++      {
++         opus_int32 p0 = f2[2 * i], p1 = f2[2 * i + 1];
++         opus_int32 t1 = t[i << shift], t2 = t[(N4 - i) << shift];
++         opus_int32 yr = R31(P(p1, t2) + P(p0, t1));
++         opus_int32 yi = R31(P(p0, t2) + P(wneg(p1), t1));
++         *yp1 = R31(P(wneg(yi), rs) + P(yr, rc));
++         *yp2 = R31(P(yr, rs) + P(yi, rc));
++         yp1 += 2 * stride;
++         yp2 -= 2 * stride;
++      }
++   }
++   RESTORE_STACK;
++}
+diff -Nru a/celt/ssc_mdct.h b/celt/ssc_mdct.h
+--- a/celt/ssc_mdct.h
++++ b/celt/ssc_mdct.h
+@@ -0,0 +1,42 @@
++/* SSC (F33.8, F34): Samsung's forward MDCT and FFT. A rewrite of libopus v1.1's
++   clt_mdct_forward()/opus_fft() for the 1728-point SSC mode, in Q31 throughout. Both
++   structs match the blob's layout (CELTMode +0x40 and the 24-byte kfft states), so the
++   harness can run either implementation on either side's tables. Every table is
++   generated from its formula (OD17). */
++#ifndef SSC_MDCT_H
++#define SSC_MDCT_H
++
++#include "opus_types.h"
++
++#define SSC_MDCT_N 1728
++#define SSC_FFT_N 432          /* N/4 at shift 0; shift 3 uses 54 */
++
++typedef struct {
++   int n3;                     /* nfft/3 */
++   int small;                  /* shift: 0 for 432 points, 3 for 54 */
++   const opus_int16 *bitrev;   /* 2*(output index of fin[k]), k < n3; fin[k+j*n3] goes to +j */
++   const opus_int32 *twiddles; /* Q31 exp(-2πik/432), shared by both sizes */
++} ssc_kfft_state;
++
++typedef struct {
++   int n;                      /* 1728 */
++   int maxshift;               /* 3 */
++   const ssc_kfft_state *kfft[2]; /* shift 0 and shift 3 (kfft[shift>>1]) */
++   const opus_int32 *trig;     /* Q31 cos(2πk/n), k = 0..n/4 */
++} ssc_mdct_lookup;
++
++/* Builds the tables (once) and returns the lookup for the 1728-point mode. */
++const ssc_mdct_lookup *ssc_mdct_init(void);
++
++/* Q31 CELT window round(2^31*w(i)), i < overlap. */
++const opus_int32 *ssc_mdct_window(int overlap);
++
++/* N/4-point complex FFT (432 or 54), scaled by 1/nfft. fin and fout are interleaved
++   re/im and must not overlap. */
++void ssc_fft(const ssc_kfft_state *st, const opus_int32 *fin, opus_int32 *fout);
++
++/* Same arguments as the blob's ssc_mdct_forward(); shift is 0 or 3. */
++void ssc_mdct_forward(const ssc_mdct_lookup *l, const opus_int32 *in, opus_int32 *out,
++      int overlap, int shift, int stride);
++
++#endif

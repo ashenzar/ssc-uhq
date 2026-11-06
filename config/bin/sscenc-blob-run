@@ -4,7 +4,7 @@
 # passes "rate channels bits bitrate" and talks to the helper over stdin/stdout.
 #
 # SSCENC_BACKEND=native (Phase 4 O5, T5.1): the native rebuild of Samsung's encoder
-# (~/src/ssc-codec/native, bit-exact with the blob, ssc-uhq F46/F47), run directly.
+# (codec/native in ssc-uhq, bit-exact with the blob, ssc-uhq F46/F47), run directly.
 # SSCENC_BACKEND=tee (T5.2): the native helper also runs the blob below on every frame,
 # sends the blob's frames on, and logs any frame where the two differ (stderr, journal).
 # Anything else (the default): Samsung's ARM64 encoder from the user's own phone under qemu,
