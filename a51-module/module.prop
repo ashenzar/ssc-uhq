@@ -1,0 +1,6 @@
+id=ssc-uhq-a51
+name=SSC UHQ for Galaxy A51
+version=v0.4
+versionCode=4
+author=asael
+description=SSC UHQ-584 (96 kHz E-mode) to Galaxy Buds3 Pro: patched libbluetooth_jni (plan-phase5-a51.md) and the S24U encoder, bind-mounted in zygote's namespace after boot.

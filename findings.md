@@ -1619,3 +1619,73 @@ The 44.1k creates give the same numbers as 48k on the same file (same mode). Get
   That last point is where T6.1 starts: in the 96k mode most of the error *power* above 24 kHz is the coded noise floor of the master, inaudible by construction.
 
 **Pitfall.** ffmpeg's `amix` with `weights=1 -1` adds the inputs, not subtracts. Use `amerge` and `pan=stereo|c0=c0-c2|c1=c1-c3` for a difference signal.
+
+## F51 Galaxy A51: the stock stack drops UHQ2 from the SSC config byte (Phase 5)
+
+Phone: SM-A515F, One UI 5.1 A515FXXU8HWK1, Magisk 31.1. The SSC code is in `libbluetooth_jni.so` of the `com.android.btservices` APEX (stock sha `e2228cc1…`), at 0x546000–0x54a9ff (`a2dp_vendor_ssc.cc` and its encoder file). The encoder `/system/lib64/libScalable_Encoder.so` is basic-only (F4).
+
+- The buds advertise 0x3e. The stock phone advertises 0x2c and sends `SET_CONFIGURATION 0c`, so UHQ2 (0x02) never goes on air.
+- `setCodecConfig` builds the out byte at 0x5478a8 as `cfg & 0x08` plus rate or hifi bits. Changing the mask to 0x0e makes the phone send 0x0e, and the buds accept it. The source-caps builder at 0x547180 (`hifi_flag | 0x28`) changed to 0x2a advertises 0x2e.
+- **The phone only sends 0x0e when the phone starts the connection.** When the buds start it (out of the case), they answer the phone's 0x2e with `SET_CONFIGURATION 0c` every time. That's basic 48k, and it still plays correctly after the patches. Linux gets UHQ because PipeWire always starts the connection.
+- The wire rate nibble stays 0x10 (48k) in UHQ, as on Linux. 96 kHz follows from UHQ2, not from a rate bit.
+
+## F52 A51: four places pin the stream to 48 kHz; the 96k code path already exists
+
+The stack has a complete 96 kHz path, but stock never reaches it, because 96k only comes from rate bit 0x80 and no peer sends that bit. Each place below had to follow UHQ2 instead:
+
+| Where | Stock | Patched |
+|---|---|---|
+| `setCodecConfig` rate enum (0x547700, 0x5476ec) | peer bit 0x10 → enum 2 (48k) | enum `2 << (cfg & 2)`: 8 (96k) with UHQ2 |
+| track-rate getter 0x546968 | `cfg & 0x04` returns 48000 before looking at the rate | UHQ2 → 96000, otherwise as stock |
+| 96k bitrate table 0x17e610 | 328000 ×4 | 584000, 584000, 291000, 152000 (F11) |
+
+- The encoder rate (global 0xc6cd14) comes from `update_hal_codec_info` (the HAL's PCM rate). The send and feeding path reads a different global, 0xc6607c, which init sets from the track-rate getter. With only the first two fixes, the encoder was created at 96k while feeding ran at 48k. The output was 224 B F-mode frames every 20 ms, which played as silence.
+- A user preference arrives a moment after start (`user.sample_rate = 0x1`, bits 0x1) and asks for 44.1k/16-bit. The rate part is ignored, but the 16-bit part was accepted (see F53).
+- Reading the globals live: toybox `dd`/`xxd` truncate 64-bit offsets on `/proc/PID/mem`. `~/src/ssc-blob/a51/patched/scripts/peek.c` (static aarch64, `pread`) reads them.
+
+## F53 A51: the 96k path wants 32-bit HAL PCM, and the feeding budget has to count 4-byte samples
+
+- At 96k, `a2dp_ssc` copies the HAL buffer straight to `ssc_encode` as int32 (`b.eq` at 0x5491e4 skips the 16- and 24-bit converters) and reads 6912 B per 864-sample frame. Packed 24-bit or 16-bit PCM in that path produced static.
+- Fix: with UHQ2, `codec_config.bits_per_sample` becomes enum 4 (32-bit), and the user bits preference is ignored. The code sits in a cave over the "bits per sample: user preference" log call (0x547770–0x54778c, entered from 0x547860). AudioFlinger then opens the A2DP output as 96000 Hz `AUDIO_FORMAT_PCM_32_BIT` with 1920-frame (20 ms) buffers.
+- The feeding budget is rate × (bits/8) × 2 × 10 ms per tick (10 ms timer). The bits value comes from the getter 0x546a74, which returned 24, giving 5760 B instead of 7680. That's 83 frames/s against 111 needed, so playback cut in and out. The getter now returns 32 with UHQ2. Nothing else reads it at 96k: the 0x18 checks are all on 48k paths, and the 24-bit flag at 0xc6cd05 is write-only.
+
+## F54 A51: fragmentation caused the distortion; one frame per packet fixes it
+
+- At 96k the stock path reads and encodes 2 frames (13824 B) per batch into one 1320 B payload. That's above the 1005 B MTU, so it went out as two RTP packets with the same timestamp (1020 B + 324 B), the second starting mid-frame. The buds played it distorted. The same frames, reassembled from the btsnoop and decoded with `ssc_native_decode`, sound clean on the PC (user, 2026-11-06): 9754 frames, 4 decode errors, −9.9 dBFS RMS.
+- 2-frame reads also hit `btif_a2dp_source_read_callback: UNDERFLOW: ONLY READ n BYTES OUT OF 13824` (about 180 per minute), because the HAL delivers 7680 B every 10 ms.
+- Fix: the batch threshold (0x54899c) and both read sizes (0x548e54, 0x549810, the active one) become 6912 B. Each packet is then one 660 B E-mode frame plus a 12 B RTP header, with the timestamp +1 per packet. That matches Linux `SSCENC_RTP_TS=frames`.
+
+## F55 A51: input scale and the result; UHQ-584 plays clean from the phone
+
+- The HAL's 32-bit PCM is Q31 (2^31). The S24U encoder is linear at 2^23 (F38.7) and rides the gain above that. That's the Linux `SSCENC_INPUT_SHIFT=0` lesson, and here it sounded "off". A 14-instruction wrapper in the r-x segment's zero tail (0xb80ca0; the file padding up to 0xb81000 is mapped executable) shifts the 864×2 int32 input right by 8 when the track rate is 96000, then tail-calls `ssc_encode`. All three `blr` call sites (0x549124, 0x549364, 0x549acc) go through it. With only the first one hooked there was no change, because the active path calls 0x549acc.
+- Result, phone-initiated connection, v13 (sha `06d82f47…`), user: "sounds good".
+  - btsnoop: 10339 packets in 93.1 s, which is 111.1/s. All are 672 B with headers `ff e0`–`ff e3` (E-mode). 10230 frames at 584k and 109 at 152k (quality index 3).
+  - Decode: 0 errors, 0 out of sync.
+  - logcat: 0 underflows, 0 timer overruns.
+  - Live globals: track 96000, bitrate 584000, bits 32, 7680 B per tick.
+  - The S24U blob (sha `90c4c1cb…`) is mapped in the Bluetooth process.
+- `tools/a51_patch_jni.py STOCK OUT` rebuilds v13 byte-identical from the stock library. Each patch asserts the stock instruction first.
+- Not done: buds-initiated connections still get basic 48k (F51), and the deploy is a test bind mount that a reboot removes.
+
+## F56 A51: the source rate never switches the mode; a codec switch in developer options gets UHQ when the buds connected themselves
+
+- **The source rate doesn't matter.** Test: the buds connected themselves (config `0c`, basic). Then 40 s of Get Lucky played as a 48k/24 FLAC and as a 96k/24 FLAC, the latter upsampled with soxr from the user's 44.1k/16 copy. AudioFlinger's track ran at 48000, then 96000. The link stayed `Rate=48000 Bits=24` and sent only 496 B `ff ee` F-mode frames at about 55/s. No RECONFIGURE or new SET_CONFIGURATION went out. The stock stack fixes the mode once per connection, and AudioFlinger resamples to the link rate.
+- **A codec switch triggers a phone-initiated config.** In Developer options, "Códec de audio Bluetooth" AAC, then back to SSC. The snoop shows the buds' `SET_CONFIGURATION 0c`, then the phone's AAC config, then the phone's SSC `0e`, which the buds accept. "Frecuencia de muestreo del audio Bluetooth" alone can't be changed, because SSC's selectable set is only 48000.
+- **The user rate preference had to be ignored.** After the switch the framework sends `user.sample_rate = 0x2` (48k). The jump table at 0x547640 then takes the 48k branch at 0x54796c, which skips the UHQ2 rate logic (F52). The result was a 96k track and 584k encoder fed from a 48k `codec_config` and HAL, which sounded "very distorted" with dropouts. v14 replaces the load at 0x547630 with `mov w8,#0`, so the default path decides. SSC offers one rate, so no real choice is lost.
+- Result (v14, sha `24a28104…`): `Config: Rate=96000 Bits=32`, 111.2 packets/s of 672 B frames, all 6621 captured frames at 584k, 0 decode errors. The user: "sounds clean", and the menu now offers 96 kHz. Module v0.3 carries v14.
+
+## F57 A51: a phone-side reconnect gets UHQ after the buds connect themselves; module v0.4 automates it
+
+What doesn't work:
+- **Advertising the buds' own byte.** The phone advertised `0x3e` instead of `0x2e` (v15 test). The buds still chose `SET_CONFIGURATION 0c`. Their choice doesn't follow the advertised capabilities.
+- **Rejecting basic.** In v16, `setCodecConfig` at 0x547458 validated the rate unless UHQ2 was set, so `0c` was rejected. The buds then gave up on A2DP, with no fallback to another codec and no phone-initiated config. Audio went to the speaker. Reverted.
+- **A root helper calling `setCodecConfigPreference`.** The helper ran under `app_process` with `ActivityThread.initializeMainlineModules()` and `systemMain()`. Without the first call, `BluetoothAdapter` reports "BluetoothServiceManager is null".
+  - `getProfileProxy(A2DP)` fails with "Unable to find app for caller", because on Android 13 it binds through ActivityManager and needs a registered app process.
+  - `IBluetoothManager.bindBluetoothProfileService` and Samsung's `bindBluetoothProfileServiceWithCaller(int, conn, String)` both return false for A2DP.
+
+What works: `BluetoothDevice.disconnect()` then `connect()` (`@SystemApi`, calling `IBluetooth.dis/connectAllEnabledProfiles`) from the same root helper. They return 0, and the phone then starts A2DP and sends `0e`. Result: `Config: Rate=96000 Bits=32`, E-mode frames at 111.2 packets/s. User: "worked like a charm".
+
+- **Helper.** `a51-module/helper/SscKick.java` uses only reflection, so it compiles with plain `javac`, and `d8` from `r8-8.5.35.jar` turns it into dex (stored in `~/src/ssc-blob/tools/`). Usage: `CLASSPATH=ssckick.dex app_process / SscKick status|reconnect [NAME]`.
+- **Watcher.** Module v0.4's `service.sh` watches `logcat -s bt_stack:I` for `SehCodecConfiguration{codecType: SSC … sampleRateHz: 48000}` and runs the reconnect, at most once per 60 s. The cost is a dropout of a few seconds after each buds-initiated connect.
+- **Adaptive bitrate.** Once on UHQ, the stack steps the bitrate down through the 96k table (F52) as link quality drops. A 10 s sample had 702 frames at 584k, 161 at 291k and 249 at 152k.
+- **Snoop parser pitfall.** `parse_btsnoop.py` labels AVDTP channels by the order they open on each ACL handle. After a reconnect on the same handle, it takes the new signaling channel for media, so it doesn't show the second SET_CONFIGURATION. Check media packets or `dumpsys` instead.
