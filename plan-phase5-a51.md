@@ -1,5 +1,7 @@
 # Phase 5: SSC UHQ-584 from a Galaxy A51
 
+**Status: done (2026-11-06).** Evaluation in F58.
+
 Status legend: [ ] todo, [~] in progress, [x] done, [-] dropped (with reason)
 
 Workflow: ssc
@@ -19,6 +21,7 @@ The stock stack only does basic 48k (F51). The method is a binary patch of
 - [x] T4 S24U encoder bind-mounted; input >>8 to 2^23 (F55). The user says it "sounds good". The btsnoop shows 111.1 packets/s of 672 B E-mode frames, 0 decode errors.
 - [x] T5 Persistence: Magisk module (`a51-module/`, `tools/a51_build_module.sh`). After a reboot it mounts both files in zygote64 and zygote by itself, and the user heard it clean (v0.3, 2026-11-06). Log: `/data/adb/modules/ssc-uhq-a51/service.log`. Uninstall: Magisk app, or `magisk --remove-modules`.
 - [x] T6 Buds-initiated connections: module v0.4 watches for an SSC stream set up at 48 kHz and reconnects from the phone, which gets UHQ (F57). User: "worked like a charm". Installed 2026-11-06, active from the next boot (tested with the same watcher started by hand).
+- [x] T7 Evaluation (F58): adaptive bitrate 584/291/152k driven by the ACL backlog, 88.2k and 192k sources play at the 96k link, 0 drops. Short PCM reads during an 88.2k track were inaudible and are left open.
 
 ## Patch v14 (sha `24a28104…`), built by `tools/a51_patch_jni.py`
 
@@ -48,8 +51,10 @@ Earlier builds v4–v12 are in `~/src/ssc-blob/a51/patched/`, with their scripts
 
 Checks: `dumpsys bluetooth_manager | grep -A3 "A2DP SSC State"` shows `Rate=96000 Bits=32`. In the btsnoop (via `adb bugreport`), the frames are `ff e0`–`ff e3` and 660 B.
 
-## Next-session checklist
+## Open items (not planned)
 
-1. After the next reboot, check that v0.4's watcher runs (`service.log` gets a "reconnecting" line after a buds-initiated connect) and listen once.
+1. Check that the v0.4 watcher runs at boot (`service.log` gets a "reconnecting" line after a buds-initiated connect).
 2. Rebuild the module after any patcher or helper change (`tools/a51_build_module.sh`, then `magisk --install-module`, then reboot). If zygote restarts without a reboot, the mounts are lost until the next boot.
-3. Optional: `codec_config` reports 96000/32 while `Selectable` says 48000/24, and the Settings developer-options codec dialog may show odd values. Check that changing the codec there doesn't break the stream.
+3. Short PCM reads during 88.2k playback (F58). They were inaudible. If clicks appear, compare against the 192k track and add slack to the reader.
+4. Turn btsnoop logging off (`persist.bluetooth.btsnooplogmode`) and compare CPU and battery against stock.
+5. `codec_config` reports 96000/32 while `Selectable` says 48000/24. Check that changing the codec in developer options doesn't break the stream.
